@@ -10,8 +10,11 @@ from __future__ import annotations
 
 import configparser
 import ctypes
+import email.utils
+import glob
 import hashlib
 import hmac
+import io
 import json
 import math
 import mimetypes
@@ -19,19 +22,27 @@ import os
 import queue
 import re
 import secrets
+import shutil
+import statistics
 import subprocess
 import sys
 import threading
 import time
 import traceback
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
+from decimal import ROUND_HALF_UP, Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qs, urlparse
 
 import webbrowser
+
+# Started as a script (full client / dev run), this file is "__main__". The helper
+# modules do "from flyconomy_client import STATE" – without this line that import
+# loads the file a second time with its own STATE, bridge and monitor (D4).
+sys.modules.setdefault("flyconomy_client", sys.modules[__name__])
 
 import requests
 
@@ -56,16 +67,21 @@ except ImportError:
     webview = None
 
 SITE_URL = "https://flyconomy.de"
-CLIENT_VERSION = "2.11.12.1"
-PANEL_FALLBACK_LATEST = "1.4.30"
-CLIENT_FALLBACK_LATEST = "2.11.12"
-UPDATER_PUSH_FALLBACK = "1.0.4"
+CLIENT_VERSION = "2.11.13"
+PANEL_FALLBACK_LATEST = "1.4.31"
+CLIENT_FALLBACK_LATEST = "2.11.13"
+# Start gate when versions.json cannot be read: never block a client or panel that
+# was allowed before (old backend fields "client"/"panel" at the time of 2.11.13).
+CLIENT_FALLBACK_MIN = "2.11.12"
+PANEL_FALLBACK_MIN = "1.4.30"
+# Only used when versions.json is unreachable – then the push is skipped anyway.
+UPDATER_PUSH_FALLBACK = "1.0.5"
 PANEL_PKG_NAME = "flyconomy-ingame-panel"
+# Panel 1.4.31+ asks twice before /cancel; older panels get a Windows question.
+PANEL_TWO_TAP_CANCEL = "1.4.31"
 
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 17474
-# Hotfix 2.11.12.1 (as 2.11.13): pages the bridge serves itself (/phone) may use it.
-BRIDGE_SELF_ORIGINS = ("http://127.0.0.1:17474", "http://localhost:17474")
 SAMPLE_SEC = 1.0  # sim poll for gates / park / teleport; track is much rarer
 MIN_TRACK_POINTS = 3
 MAX_TRACK_POINTS_SEND = 200  # ~5 min spacing → 1h ≈ 12 pts; long haul still compact
@@ -96,6 +112,9 @@ PARK_GS_KT = 3.0  # GA: still tight so taxi hold-shorts do not auto-end
 PARK_GS_KT_AIRLINER = 8.0  # Fenix/GSX creep, tug, SimConnect jitter
 PARK_AGL_FT = 80.0  # jet CG at the gate is often 15–40 ft; 25 blocked A220/Fenix
 AIRBORNE_GS_KT = 40.0
+GROUND_GLITCH_AGL_FT = 1000.0
+MAX_SIM_RATE = 16.0  # default; /start sends max_sim_rate (D10)
+GROUND_GLITCH_GS_KT = 250.0
 PARK_BRAKE_LVARS = (
     "L:S_MIP_PARK_BRAKE",
     "L:S_PED_PARK_BRAKE",
@@ -202,6 +221,160 @@ FLIGHT_SESSION_PATH = os.path.join(os.path.expanduser("~"), ".flyconomy_flight_s
 RETRY_INTERVAL_SEC = 60
 # Production API is fixed — users never need to type this.
 DEFAULT_API_URL = "https://flyconomy.de/api"
+# A queued start is dropped when the aircraft moved in the meantime (D7).
+PENDING_START_MAX_GS_KT = 5.0
+PENDING_START_MAX_MOVE_NM = 1.0
+# Bridge: browsers may only talk to us from the panel (coui://) or our own pages.
+BRIDGE_SELF_ORIGINS = ("http://127.0.0.1:17474", "http://localhost:17474")
+
+
+# ---------------------------------------------------------------------------
+# Crash-safe files (D3): temp file + flush + fsync, previous version kept as .bak,
+# atomic os.replace (retried while Windows/AV briefly locks the target).
+# ---------------------------------------------------------------------------
+
+
+def _replace_with_retry(src: str, dst: str, retries: int = 10) -> None:
+    for i in range(retries):
+        try:
+            os.replace(src, dst)
+            return
+        except PermissionError:
+            if i == retries - 1:
+                raise
+            time.sleep(0.05 * (i + 1))
+
+
+def atomic_write_text(path: str, text: str, *, keep_bak: bool = True) -> None:
+    folder = os.path.dirname(os.path.abspath(path)) or "."
+    os.makedirs(folder, exist_ok=True)
+    tmp = f"{path}.tmp-{os.getpid()}-{threading.get_ident()}"
+    try:
+        with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        if keep_bak and os.path.exists(path):
+            try:
+                shutil.copyfile(path, path + ".bak")
+            except OSError:
+                pass  # the main file is still intact; a missing .bak is no harm
+        _replace_with_retry(tmp, path)
+    finally:
+        if os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+
+
+def atomic_write_json(path: str, data: Any) -> None:
+    atomic_write_text(path, json.dumps(data))
+
+
+def read_json_file(path: str) -> Any:
+    """Main file first, the .bak copy if the main file is missing or broken."""
+    for candidate in (path, path + ".bak"):
+        try:
+            if not os.path.exists(candidate):
+                continue
+            with open(candidate, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            continue
+    return None
+
+
+def remove_file_and_bak(path: str) -> None:
+    # .bak first: a crash in between leaves the old main file, never a resurrected .bak
+    for candidate in (path + ".bak", path):
+        try:
+            if os.path.exists(candidate):
+                os.remove(candidate)
+        except OSError:
+            pass
+
+
+def file_or_bak_exists(path: str) -> bool:
+    return os.path.exists(path) or os.path.exists(path + ".bak")
+
+
+# ---------------------------------------------------------------------------
+# Server clock (D5): offset from the HTTP Date header, used when signing points.
+# ---------------------------------------------------------------------------
+
+
+class ServerClock:
+    DEAD_BAND_MS = 2000  # below this the PC clock is fine – keep 0 (no jitter)
+    HINT_MS = 60_000
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._samples: List[float] = []
+        self.offset_ms = 0
+        self.raw_ms = 0.0
+        self.known = False
+
+    def observe(self, date_header: Any, t_send: float, t_recv: float) -> None:
+        if not date_header:
+            return
+        rtt = t_recv - t_send
+        if rtt < 0 or rtt > 10:
+            return
+        try:
+            dt = email.utils.parsedate_to_datetime(str(date_header))
+        except (TypeError, ValueError, IndexError):
+            return
+        if dt is None:
+            return
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        # The header is cut to whole seconds: the true time is +0…999 ms.
+        server_ms = dt.timestamp() * 1000.0 + 500.0
+        local_ms = (t_send + t_recv) * 500.0
+        with self._lock:
+            self._samples.append(server_ms - local_ms)
+            del self._samples[:-7]
+            med = statistics.median(self._samples)
+            self.raw_ms = med
+            self.known = True
+            self.offset_ms = int(round(med)) if abs(med) >= self.DEAD_BAND_MS else 0
+
+    def now_ms(self) -> int:
+        return int(time.time() * 1000) + int(self.offset_ms)
+
+    def reset(self) -> None:
+        with self._lock:
+            self._samples = []
+            self.offset_ms = 0
+            self.raw_ms = 0.0
+            self.known = False
+
+
+SERVER_CLOCK = ServerClock()
+
+
+def now_ms() -> int:
+    """Milliseconds on the server's clock (local clock + measured offset)."""
+    return SERVER_CLOCK.now_ms()
+
+
+def js_to_fixed(value: Any, digits: int) -> str:
+    """Exactly JavaScript's Number.prototype.toFixed (the backend signs with it).
+
+    Python's format() rounds an exact binary tie (26.125 → "26.12") half-to-even,
+    JavaScript rounds it up ("26.13"), and Python keeps "-0.0" where JS writes
+    "0.0". Both differences broke track signatures for such values.
+    """
+    x = float(value)
+    if math.isnan(x):
+        return "NaN"
+    if math.isinf(x):
+        return "Infinity" if x > 0 else "-Infinity"
+    neg = x < 0
+    q = Decimal(abs(x)).quantize(Decimal(1).scaleb(-digits), rounding=ROUND_HALF_UP)
+    text = format(q, "f")
+    return "-" + text if neg else text
 
 
 def _sim_str(val: Any) -> str:
@@ -236,11 +409,76 @@ class KeepFlyingError(RuntimeError):
         self.code = code
 
 
+class EndBusyError(RetryableError):
+    """The server is still processing an earlier /end of this flight (END_BUSY)."""
+
+
+class SessionInvalidError(KeepFlyingError):
+    """SESSION_INVALID / SESSION_MISSING: this end payload can never succeed."""
+
+
+class FlightClosedError(RuntimeError):
+    """The server closed the flight for good (rejected / cancelled)."""
+
+    def __init__(self, message: str, code: str = "FLIGHT_CLOSED") -> None:
+        super().__init__(message)
+        self.code = code
+
+
+class NoActiveFlightError(RuntimeError):
+    """Old server: 'Kein aktiver Flug.' – the flight is gone (maybe already logged)."""
+
+
+class ServerRejectedError(RuntimeError):
+    """/flights/tracking: the server rejected the running flight (it is over)."""
+
+
+class VersionGateError(RuntimeError):
+    """Client or panel below clientMin/panelMin – starting is not allowed."""
+
+    def __init__(self, message: str, info: Optional[dict] = None) -> None:
+        super().__init__(message)
+        self.info = info or {}
+
+
+def scrub_config_leftovers() -> None:
+    """After a login or logout: no copy of an old token may stay on disk (review S8).
+
+    atomic_write_text keeps the previous ini as .bak – with the token of the account
+    that just logged out. A hard crash can also leave a .tmp-<pid>-<tid> file."""
+    try:
+        if os.path.exists(CONFIG_PATH + ".bak"):
+            os.remove(CONFIG_PATH + ".bak")
+    except OSError:
+        pass
+    own = f".tmp-{os.getpid()}-"
+    for leftover in glob.glob(glob.escape(CONFIG_PATH) + ".tmp-*"):
+        if own in leftover:
+            continue  # another thread of this process may be writing right now
+        try:
+            os.remove(leftover)
+        except OSError:
+            pass
+
+
 class ConfigManager:
     def __init__(self) -> None:
         self.config = configparser.ConfigParser()
-        if os.path.exists(CONFIG_PATH):
-            self.config.read(CONFIG_PATH)
+        for candidate in (CONFIG_PATH, CONFIG_PATH + ".bak"):
+            if not os.path.exists(candidate):
+                continue
+            try:
+                parsed = configparser.ConfigParser()
+                parsed.read(candidate, encoding="utf-8")
+                if candidate.endswith(".bak") and parsed.has_section("Credentials"):
+                    # Never sign in from the backup copy: it may hold the token of a
+                    # session that was logged out since (review S8). Re-login instead.
+                    for secret in ("access_token", "password"):
+                        parsed.remove_option("Credentials", secret)
+                self.config = parsed
+                break
+            except (configparser.Error, OSError, UnicodeDecodeError):
+                continue  # half-written ini (old client, power cut): try the .bak
         if "Credentials" not in self.config:
             self.config["Credentials"] = {}
         if "Settings" not in self.config:
@@ -248,10 +486,22 @@ class ConfigManager:
         # Always pin production API (ignore old localhost entries).
         self.config["Settings"]["api_url"] = DEFAULT_API_URL
 
-    def save(self) -> None:
+    def save(self, *, secret_changed: bool = False) -> None:
         self.config["Settings"]["api_url"] = DEFAULT_API_URL
-        with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-            self.config.write(f)
+        buf = io.StringIO()
+        self.config.write(buf)
+        atomic_write_text(CONFIG_PATH, buf.getvalue(), keep_bak=not secret_changed)
+        if secret_changed:
+            scrub_config_leftovers()
+
+    def feature_override(self, name: str) -> Optional[bool]:
+        """[Settings] feature_<name> = true/false in the ini (beta testers)."""
+        raw = self.config.get("Settings", f"feature_{name}", fallback="").strip().lower()
+        if raw in ("1", "true", "yes", "on"):
+            return True
+        if raw in ("0", "false", "no", "off"):
+            return False
+        return None
 
     @property
     def username(self) -> str:
@@ -279,15 +529,24 @@ class ConfigManager:
     def set_credentials(self, username: str, password: str) -> None:
         self.config["Credentials"]["username"] = username
         self.config["Credentials"]["password"] = password
-        self.save()
+        self.save(secret_changed=True)
 
     def set_access_token(self, token: str, username: str = "") -> None:
-        self.config["Credentials"]["access_token"] = token.strip()
+        token = token.strip()
+        creds = self.config["Credentials"]
+        changed = (
+            creds.get("access_token", "") != token
+            or creds.get("password", "") != ""
+            or (bool(username) and creds.get("username", "") != username)
+        )
+        if not changed:
+            return  # D3: only a real token change touches the ini
+        creds["access_token"] = token
         # Clear legacy password so we don't keep stale secrets around.
-        self.config["Credentials"]["password"] = ""
+        creds["password"] = ""
         if username:
-            self.config["Credentials"]["username"] = username
-        self.save()
+            creds["username"] = username
+        self.save(secret_changed=True)
 
     def set_api_url(self, url: str) -> None:
         # Kept for compatibility with older panel payloads; always ignored.
@@ -387,26 +646,73 @@ class ConfigManager:
         return max(0.5, min(10.0, n))
 
 
-def _msfs_process_running() -> bool:
-    """True only if an MSFS process is actually running on Windows."""
-    if sys.platform != "win32":
-        return True
-    names = (
-        "FlightSimulator.exe",
-        "FlightSimulator2024.exe",
-        "FlightSimulator2020.exe",
-    )
-    try:
-        import subprocess
+MSFS_PROCESS_NAMES = (
+    "FlightSimulator.exe",
+    "FlightSimulator2024.exe",
+    "FlightSimulator2020.exe",
+)
+TASKLIST_CACHE_SEC = 5.0
+TASKLIST_MISSES_TO_DROP = 3
 
-        out = subprocess.check_output(
-            ["tasklist", "/FO", "CSV", "/NH"],
-            stderr=subprocess.DEVNULL,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        ).decode("utf-8", errors="ignore").lower()
-        return any(n.lower() in out for n in names)
-    except Exception:
-        return False
+
+class _ProcessWatch:
+    """tasklist at most every 5 s (it ran twice per second); MSFS counts as gone
+    only after three negative answers in a row (D9)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.checked_at = 0.0
+        self.last_seen: Optional[bool] = None  # None = never asked yet
+        self.misses = 0
+
+    def _query(self) -> Optional[bool]:
+        if sys.platform != "win32":
+            return True
+        try:
+            out = subprocess.check_output(
+                ["tasklist", "/FO", "CSV", "/NH"],
+                stderr=subprocess.DEVNULL,
+                timeout=5,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            ).decode("utf-8", errors="ignore").lower()
+            return any(n.lower() in out for n in MSFS_PROCESS_NAMES)
+        except Exception:
+            return None  # tasklist hung or failed: no verdict
+
+    def running(self) -> bool:
+        with self._lock:
+            now = time.time()
+            if self.last_seen is not None and now - self.checked_at < TASKLIST_CACHE_SEC:
+                return bool(self.last_seen)
+            self.checked_at = now
+        found = self._query()
+        with self._lock:
+            if found is None:
+                return bool(self.last_seen)
+            if found:
+                self.misses = 0
+                self.last_seen = True
+            elif self.last_seen is None:
+                self.last_seen = False  # first answer: no flapping to filter yet
+            else:
+                self.misses += 1
+                if self.misses >= TASKLIST_MISSES_TO_DROP:
+                    self.last_seen = False
+            return bool(self.last_seen)
+
+    def reset(self) -> None:
+        with self._lock:
+            self.checked_at = 0.0
+            self.last_seen = None
+            self.misses = 0
+
+
+PROCESS_WATCH = _ProcessWatch()
+
+
+def _msfs_process_running() -> bool:
+    """True while an MSFS process runs (cached; 3 negative tasklist answers to drop)."""
+    return PROCESS_WATCH.running()
 
 
 # Writable tanks (python-simconnect names). LEVEL is 0.0–1.0 (Percent Over 100).
@@ -425,6 +731,18 @@ _FUEL_TANKS = (
 )
 
 
+CORE_SIMVARS = (
+    "PLANE_LATITUDE",
+    "PLANE_LONGITUDE",
+    "PLANE_ALTITUDE",
+    "GROUND_VELOCITY",
+    "SIMULATION_RATE",
+    "SIM_ON_GROUND",
+)
+CORE_READ_ATTEMPTS = 14  # × 10 ms; the default 4 gave up after 40 ms under load (D9)
+PAUSE_EX1_EVENT_ID = 0xFC01  # our own client event id for the "Pause_EX1" system event
+
+
 class SimReader:
     def __init__(self) -> None:
         self.sm: Optional[SimConnect] = None
@@ -436,9 +754,65 @@ class SimReader:
         self._atc_def = None
         self._atc_def256 = None
         self._lvars: Dict[str, Any] = {}
+        self._adhoc: Dict[str, Any] = {}
         self._custom_fuel: Optional[bool] = None
         self._last_sim_time: Optional[float] = None
         self._last_sim_time_wall: float = 0.0
+        self._pause_ex1: Optional[int] = None
+        self._pause_ex1_on = False
+        self.read_stats: Dict[str, float] = {"last_ms": 0.0, "max_ms": 0.0, "avg_ms": 0.0, "n": 0.0}
+
+    def _boost_core_reads(self) -> None:
+        if not self.aq:
+            return
+        for key in CORE_SIMVARS:
+            try:
+                req = self.aq.find(key)
+                if req is not None:
+                    req.attemps = CORE_READ_ATTEMPTS
+            except Exception:
+                pass
+
+    def _subscribe_pause_ex1(self) -> None:
+        """Real pause detection via the Pause_EX1 system event (behind a switch, D9)."""
+        self._pause_ex1 = None
+        self._pause_ex1_on = False
+        sm = self.sm
+        if sm is None or not feature_enabled("pause_ex1"):
+            return
+        try:
+            original = sm.handle_id_event
+            reader = self
+
+            def handler(evt: Any) -> None:
+                try:
+                    if int(evt.uEventID) == PAUSE_EX1_EVENT_ID:
+                        reader._pause_ex1 = int(evt.dwData)
+                        return
+                except Exception:
+                    pass
+                original(evt)
+
+            sm.handle_id_event = handler
+            err = sm.dll.SubscribeToSystemEvent(sm.hSimConnect, PAUSE_EX1_EVENT_ID, b"Pause_EX1")
+            self._pause_ex1_on = bool(sm.IsHR(err, 0))
+        except Exception as e:
+            print("Pause_EX1:", e)
+            self._pause_ex1_on = False
+
+    def pause_ex1_active(self) -> Optional[bool]:
+        """True/False from Pause_EX1, None while unknown or switched off."""
+        if not self._pause_ex1_on or self._pause_ex1 is None:
+            return None
+        return self._pause_ex1 != 0
+
+    def note_read_ms(self, ms: float) -> None:
+        st = self.read_stats
+        n = st.get("n", 0.0) + 1.0
+        st["n"] = n
+        st["last_ms"] = round(ms, 1)
+        st["max_ms"] = round(max(st.get("max_ms", 0.0), ms), 1)
+        st["avg_ms"] = round(st.get("avg_ms", 0.0) + (ms - st.get("avg_ms", 0.0)) / min(n, 50.0), 1)
 
     def connect(self) -> tuple[bool, str]:
         self.close()
@@ -447,6 +821,7 @@ class SimReader:
         try:
             self.sm = SimConnect()
             self.aq = AircraftRequests(self.sm, _time=150, _attemps=4)
+            self._boost_core_reads()
             try:
                 self.ae = AircraftEvents(self.sm)
             except Exception:
@@ -459,6 +834,7 @@ class SimReader:
                 if lat is not None and lon is not None:
                     self.connected = True
                     self._misses = 0
+                    self._subscribe_pause_ex1()
                     try:
                         GROUND.attach(self.sm)
                         GROUND.start_def = STATE.config.hotkey_start
@@ -493,9 +869,12 @@ class SimReader:
             self._atc_def = None
             self._atc_def256 = None
             self._lvars = {}
+            self._adhoc = {}
             self._custom_fuel = None
             self._last_sim_time = None
             self._last_sim_time_wall = 0.0
+            self._pause_ex1 = None
+            self._pause_ex1_on = False
 
     def ping_process(self) -> bool:
         """Cheap health check for the UI thread — never blocks on SimConnect."""
@@ -558,11 +937,78 @@ class SimReader:
         if isinstance(val, (bytes, bytearray)):
             val = val.decode("ascii", "ignore")
         if isinstance(val, str):
-            return val.strip().lower() in ("1", "true", "yes")
+            return val.strip().lower() in ("1", "-1", "true", "yes")
         try:
-            return float(val) > 0.5
+            # SimConnect BOOLs sometimes arrive as -1 (all bits set) – that is "true".
+            return abs(float(val)) > 0.5
         except (TypeError, ValueError):
             return bool(val)
+
+    def _adhoc_get(self, name: str, unit: str) -> Optional[float]:
+        """A simvar outside the python-simconnect catalog (cached request)."""
+        if not self.sm:
+            return None
+        key = f"{name}|{unit}"
+        req = self._adhoc.get(key)
+        try:
+            if req is None:
+                from SimConnect.RequestList import Request
+
+                req = Request((name.encode("utf-8"), unit.encode("utf-8")), self.sm, _time=500, _attemps=10)
+                self._adhoc[key] = req
+            with self._io:
+                val = req.value
+            return float(val) if val is not None else None
+        except Exception:
+            return None
+
+    def fuel_system_info(self) -> dict:
+        """E7: what the sim says about its fuel system (reported to the server)."""
+        out: Dict[str, Any] = {}
+        if not self.connected:
+            return out
+
+        def num(v: Any) -> Optional[float]:
+            try:
+                f = float(v)
+            except (TypeError, ValueError):
+                return None
+            return round(f, 3) if math.isfinite(f) else None
+
+        nfs = self._adhoc_get("NEW FUEL SYSTEM", "Bool")
+        out["new_fuel_system"] = None if nfs is None else bool(abs(nfs) > 0.5)
+        out["fuel_weight_per_gallon_lb"] = num(self._get("FUEL_WEIGHT_PER_GALLON"))
+        out["sim_capacity_gal"] = num(self._get("FUEL_TOTAL_CAPACITY"))
+        out["fuel_total_gal"] = num(self._get("FUEL_TOTAL_QUANTITY"))
+        # MSFS 2024 (SU2+) EX1 variants; names not verifiable here – None when unknown.
+        out["sim_capacity_ex1_gal"] = num(self._adhoc_get("FUEL TOTAL CAPACITY EX1", "Gallons"))
+        out["fuel_total_ex1_gal"] = num(self._adhoc_get("FUEL TOTAL QUANTITY EX1", "Gallons"))
+        out["title"] = self.sim_title()[:120]
+        return out
+
+    def reposition(self, point: dict) -> bool:
+        """Put the aircraft back on a recorded track point (pilot's explicit choice)."""
+        if not self.connected or not self.aq:
+            return False
+        try:
+            lat = float(point["latitude"])
+            lon = float(point["longitude"])
+        except (KeyError, TypeError, ValueError):
+            return False
+        alt = _finite(point.get("altitude"))
+        hdg = point.get("heading")
+        gs = _finite(point.get("ground_speed"))
+        on_ground = bool(point.get("on_ground"))
+        with self._io:
+            ok = self._set("PLANE_LATITUDE", lat, force=True)
+            ok = self._set("PLANE_LONGITUDE", lon, force=True) and ok
+            ok = self._set("PLANE_ALTITUDE", alt, force=True) and ok
+            if hdg is not None:
+                self._set("PLANE_HEADING_DEGREES_TRUE", math.radians(_finite(hdg)), force=True)
+            if not on_ground and gs > 30:
+                # keep flying at the recorded ground speed (ft/s along the body axis)
+                self._set("VELOCITY_BODY_Z", gs * 1.68781, force=True)
+        return ok
 
     def _set(self, name: str, value: Any, force: bool = False) -> bool:
         """Set sim vars. force=True also writes when the catalog omits settable."""
@@ -1307,9 +1753,11 @@ class SimReader:
             rate_now = float(data.get("simulation_rate") or 1.0)
             # Active pause / Pause-at-TOD freezes sim time without slew.
             data["is_slew"] = slew
-            data["paused"] = (not slew) and (
-                pause_ind or pause_state >= 1 or sim_frozen or rate_now <= 0.01
-            )
+            ex1 = self.pause_ex1_active()
+            flagged = ex1 if ex1 is not None else (pause_ind or pause_state >= 1)
+            data["paused"] = (not slew) and (bool(flagged) or sim_frozen or rate_now <= 0.01)
+            if ex1 is not None:
+                data["pause_ex1"] = int(self._pause_ex1 or 0)
             agl_v = self._get_any("PLANE_ALT_ABOVE_GROUND", "PLANE ALT ABOVE GROUND")
             try:
                 agl_f = float(agl_v) if agl_v is not None else None
@@ -1339,6 +1787,15 @@ class SimReader:
                 # Only when nearly stopped — never in the air.
                 on_gnd = True
             data["on_ground"] = on_gnd
+            # "On the ground" far up in the air is a SimConnect glitch (seen with
+            # Fenix): such a sample is discarded by the monitor (D8).
+            data["ground_glitch"] = bool(
+                on_sim
+                and (
+                    (agl_f is not None and agl_f > GROUND_GLITCH_AGL_FT)
+                    or (agl_f is None and gs > GROUND_GLITCH_GS_KT)
+                )
+            )
             for key, simvar in (
                 ("aircraft_type", "TITLE"),
                 ("atc_model", "ATC_MODEL"),
@@ -1354,11 +1811,41 @@ class SimReader:
             return None
 
 
+def _retry_after_of(r: Any, body: Any, default: int = RETRY_INTERVAL_SEC) -> int:
+    raw = None
+    if isinstance(body, dict):
+        raw = body.get("retry_after_seconds")
+    if raw is None:
+        try:
+            raw = r.headers.get("Retry-After")
+        except Exception:
+            raw = None
+    try:
+        wait = int(float(raw)) if raw is not None else default
+    except (TypeError, ValueError):
+        wait = default
+    return max(5, min(wait, 1800))
+
+
 class FlyConomyAPI:
     def __init__(self, config: ConfigManager) -> None:
         self.config = config
         self.token: Optional[str] = None
         self.user: Optional[dict] = None
+        # One door for every HTTP call: measures the server clock (D5) and lets
+        # tests replace the network with a fake server.
+        self.transport = requests.request
+
+    def _req(self, method: str, url: str, **kwargs: Any) -> Any:
+        t0 = time.time()
+        r = self.transport(method, url, **kwargs)
+        t1 = time.time()
+        try:
+            SERVER_CLOCK.observe((r.headers or {}).get("Date"), t0, t1)
+            note_clock_skew()
+        except Exception:
+            pass
+        return r
 
     def _token(self) -> str:
         tok = (self.token or "").strip()
@@ -1391,7 +1878,7 @@ class FlyConomyAPI:
         if not self._token():
             return False
         try:
-            r = requests.post(
+            r = self._req("POST",
                 f"{self.config.api_url}/auth/refresh",
                 headers=self._headers(),
                 timeout=12,
@@ -1418,7 +1905,7 @@ class FlyConomyAPI:
         previous = (self.token or self.config.access_token or "").strip()
         try:
             self.token = token
-            r = requests.get(
+            r = self._req("GET",
                 f"{self.config.api_url}/auth/me",
                 headers=self._headers(),
                 timeout=15,
@@ -1451,18 +1938,18 @@ class FlyConomyAPI:
             return False, str(e)
 
     def get_myflight(self) -> dict:
-        r = requests.get(f"{self.config.api_url}/myflight", headers=self._headers(), timeout=15)
+        r = self._req("GET", f"{self.config.api_url}/myflight", headers=self._headers(), timeout=15)
         r.raise_for_status()
         return r.json()
 
     def get_active(self) -> Optional[dict]:
-        r = requests.get(f"{self.config.api_url}/flights/active", headers=self._headers(), timeout=15)
+        r = self._req("GET", f"{self.config.api_url}/flights/active", headers=self._headers(), timeout=15)
         r.raise_for_status()
         return r.json().get("flight")
 
     def get_nearby(self, lat: float, lon: float) -> Optional[dict]:
         try:
-            r = requests.get(
+            r = self._req("GET",
                 f"{self.config.api_url}/airports/search/nearby",
                 params={"lat": lat, "lon": lon, "radius": 3, "limit": 1},
                 headers=self._headers(),
@@ -1481,7 +1968,7 @@ class FlyConomyAPI:
             return None
 
     def request_livery(self, payload: dict) -> dict:
-        r = requests.post(
+        r = self._req("POST",
             f"{self.config.api_url}/liveries/request",
             json=payload,
             headers=self._headers(),
@@ -1495,7 +1982,7 @@ class FlyConomyAPI:
     def get_fuel_sellers(self, icao: str, fuel_type: str) -> dict:
         icao = str(icao or "").strip().upper()
         ft = "jeta" if str(fuel_type).lower() in ("jeta", "1", "jet-a") else "100ll"
-        r = requests.get(
+        r = self._req("GET",
             f"{self.config.api_url}/fbos/airport/{icao}/fuel-sellers",
             params={"fuel_type": ft},
             headers=self._headers(),
@@ -1507,7 +1994,7 @@ class FlyConomyAPI:
         return data
 
     def refuel(self, payload: dict) -> dict:
-        r = requests.post(
+        r = self._req("POST",
             f"{self.config.api_url}/myflight/refuel",
             json=payload,
             headers=self._headers(),
@@ -1520,7 +2007,7 @@ class FlyConomyAPI:
 
     def get_hours_remaining(self) -> Optional[float]:
         try:
-            r = requests.get(f"{self.config.api_url}/users/stats", headers=self._headers(), timeout=8)
+            r = self._req("GET", f"{self.config.api_url}/users/stats", headers=self._headers(), timeout=8)
             if r.status_code != 200:
                 return None
             data = r.json() or {}
@@ -1532,7 +2019,7 @@ class FlyConomyAPI:
 
     def start_flight(self, sample: dict) -> dict:
         try:
-            r = requests.post(
+            r = self._req("POST",
                 f"{self.config.api_url}/flights/start",
                 json=sample,
                 headers=self._headers(),
@@ -1541,7 +2028,14 @@ class FlyConomyAPI:
         except requests.RequestException as e:
             raise RetryableError(f"Server nicht erreichbar: {e}") from e
         if r.status_code in (429, 502, 503, 504) or r.status_code >= 500:
-            raise RetryableError("Server gerade nicht verfügbar")
+            try:
+                body = r.json()
+            except Exception:
+                body = {}
+            raise RetryableError(
+                (body or {}).get("error") or "Server gerade nicht verfügbar",
+                _retry_after_of(r, body),
+            )
         try:
             data = r.json()
         except Exception as e:
@@ -1552,7 +2046,7 @@ class FlyConomyAPI:
 
     def tracking(self, sample: dict) -> dict:
         try:
-            r = requests.post(
+            r = self._req("POST",
                 f"{self.config.api_url}/flights/tracking",
                 json=sample,
                 headers=self._headers(),
@@ -1569,7 +2063,11 @@ class FlyConomyAPI:
         except Exception:
             raise RetryableError("Server antwortete ungültig")
         if r.status_code >= 400:
-            raise RuntimeError(data.get("error", r.text))
+            msg = str((data or {}).get("error") or r.text or f"HTTP {r.status_code}")[:400]
+            if isinstance(data, dict) and data.get("rejected"):
+                # The server has already closed the flight – its verdict, not ours.
+                raise ServerRejectedError(msg)
+            raise RuntimeError(msg)
         return data
 
     def end_flight(
@@ -1585,7 +2083,7 @@ class FlyConomyAPI:
     def submit_end(self, payload: dict) -> dict:
         """Posts a prepared end payload. Raises RetryableError when it is worth queueing."""
         try:
-            r = requests.post(
+            r = self._req("POST",
                 f"{self.config.api_url}/flights/end",
                 json=payload,
                 headers=self._headers(),
@@ -1599,14 +2097,16 @@ class FlyConomyAPI:
                 body = r.json()
             except Exception:
                 body = {}
-            wait = int(body.get("retry_after_seconds") or r.headers.get("Retry-After") or RETRY_INTERVAL_SEC)
             raise RetryableError(
-                body.get("error") or "Server gerade nicht verfügbar", max(15, min(wait, 1800))
+                (body or {}).get("error") or "Server gerade nicht verfügbar",
+                max(15, _retry_after_of(r, body)),
             )
 
         try:
             data = r.json()
         except Exception:
+            data = {}
+        if not isinstance(data, dict):
             data = {}
         if r.status_code == 413:
             raise RuntimeError(
@@ -1620,6 +2120,37 @@ class FlyConomyAPI:
             err_l = str(err).lower()
             if code in ("restricted", "banned", "tos_required"):
                 raise RuntimeError(str(err)[:400] or f"HTTP {r.status_code}")
+            # Session codes first: an old server sends SESSION_INVALID as 403 with
+            # "Session" in the text, which used to land in the token branch below
+            # and was retried forever (C9).
+            if code in ("SESSION_INVALID", "SESSION_MISSING"):
+                raise SessionInvalidError(
+                    str(err)[:400]
+                    or "Flug-Session ungültig. Bitte „Abbrechen“ und neu starten.",
+                    code,
+                )
+            if code == "END_BUSY" or (
+                r.status_code == 409 and "abrechnung" in err_l and "bereits abgerechnet" not in err_l
+            ):
+                raise EndBusyError(
+                    str(err)[:400] or "Flugende läuft noch – gleich nochmal versuchen.",
+                    _retry_after_of(r, data, default=8),
+                )
+            if code in ("FLIGHT_ALREADY_REJECTED", "FLIGHT_REJECTED", "FLIGHT_CANCELLED"):
+                reason = str(data.get("reason") or data.get("rejection_reason") or err)[:400]
+                raise FlightClosedError(reason, code)
+            if r.status_code == 409 and "bereits abgerechnet" in err_l:
+                # Old server: the first /end was booked, only its answer got lost.
+                return {
+                    "already_logged": True,
+                    "message": str(err)[:400],
+                    "flight_id": data.get("flight_id"),
+                    "new_balance": data.get("new_balance"),
+                }
+            if "kein aktiver flug" in err_l or "no active flight" in err_l:
+                raise NoActiveFlightError(str(err)[:400])
+            if "auszahlung gesperrt" in err_l:
+                raise FlightClosedError(str(err)[:400], "FLIGHT_REJECTED")
             if r.status_code in (401, 403) and (
                 code in ("token_expired", "session_revoked", "token")
                 or "token" in err_l
@@ -1654,28 +2185,15 @@ class FlyConomyAPI:
                     "flight": data.get("flight") or {},
                     "flight_id": data.get("flight_id"),
                 }
-            if code == "END_BUSY" or (
-                r.status_code == 409 and "abrechnung" in str(err).lower()
-            ):
-                raise KeepFlyingError(
-                    str(err)[:400] or "Flugende läuft noch – gleich nochmal versuchen.",
-                    "END_BUSY",
-                )
             if code == "NOT_ON_GROUND":
                 raise KeepFlyingError(str(err)[:400], "NOT_ON_GROUND")
             if code == "BAD_POSITION":
                 raise KeepFlyingError(str(err)[:400], "BAD_POSITION")
-            if code in ("SESSION_INVALID", "SESSION_MISSING"):
-                raise KeepFlyingError(
-                    str(err)[:400]
-                    or "Flug-Session ungültig. Bitte „Abbrechen“ und neu starten.",
-                    code,
-                )
             raise RuntimeError(str(err)[:400] or f"HTTP {r.status_code}")
         return data
 
     def cancel_flight(self, reason: str = "") -> dict:
-        r = requests.post(
+        r = self._req("POST",
             f"{self.config.api_url}/flights/cancel",
             json={"reason": (reason or "")[:300]},
             headers=self._headers(),
@@ -1684,7 +2202,7 @@ class FlyConomyAPI:
         return r.json()
 
     def get_preferences(self) -> dict:
-        r = requests.get(
+        r = self._req("GET",
             f"{self.config.api_url}/users/preferences",
             headers=self._headers(),
             timeout=15,
@@ -1693,7 +2211,7 @@ class FlyConomyAPI:
         return r.json()
 
     def set_preferences(self, share_live_position: bool) -> dict:
-        r = requests.put(
+        r = self._req("PUT",
             f"{self.config.api_url}/users/preferences",
             json={"shareLivePosition": share_live_position},
             headers=self._headers(),
@@ -1703,7 +2221,7 @@ class FlyConomyAPI:
         return r.json()
 
     def submit_problem_report(self, payload: dict) -> dict:
-        r = requests.post(
+        r = self._req("POST",
             f"{self.config.api_url}/users/problem-reports",
             json=payload,
             headers=self._headers(),
@@ -1726,7 +2244,7 @@ class FlyConomyAPI:
         return data
 
     def crew_presence(self, body: dict) -> dict:
-        r = requests.post(
+        r = self._req("POST",
             f"{self.config.api_url}/crew/presence",
             json=body,
             headers=self._headers(),
@@ -1829,6 +2347,50 @@ class AppState:
         self._panel_latest_at: float = 0.0
         self._panel_download: str = f"{SITE_URL}/downloads/FlyConomy-MSFS-Panel.zip"
         self._client_download: str = f"{SITE_URL}/downloads/FlyConomyMiniClient_Setup.exe"
+        # 2.11.13: version gate on clientMin/panelMin, update hint on clientLatest.
+        self._client_min: str = CLIENT_FALLBACK_MIN
+        self._panel_min: str = PANEL_FALLBACK_MIN
+        self._versions_ok: bool = False
+        self._versions_next_at: float = 0.0
+        self._versions_busy: bool = False
+        self._server_features: dict = {}
+        self._flight_features: dict = {}
+        self._download_hashes: dict = {}
+        # Flight-scoped values from /start (persisted in the session file).
+        self.max_sim_rate: float = MAX_SIM_RATE
+        self.fuel_policy: dict = {}
+        self._max_gs_seen: float = 0.0
+        self._flight_title: str = ""
+        self._title_mismatch_ticks: int = 0
+        self._fuel_report_due: Optional[dict] = None
+        # Gaps, jumps and the restore after a restart (D1/D8/D9).
+        self._read_misses: int = 0
+        self._gap_reason: str = ""
+        self._gap_wall_since: float = 0.0
+        self._restored_session: bool = False
+        self._mismatch_kind: str = ""
+        self._mismatch_ref: Optional[dict] = None
+        self._mismatch_consistent: int = 0
+        self._mismatch_prompted: bool = False
+        self._mismatch_choice: str = ""
+        self._mismatch_reported: bool = False
+        self._recent_samples: List[dict] = []
+        self._ground_glitch_logged: bool = False
+        # Review S8: one odd sample after a gap is no proof – a second one must agree.
+        self._gap_confirm: int = 0
+        self._gap_fuel_confirm: int = 0
+        self._mismatch_allowed_nm: float = 0.0
+        self._title_change_logged: bool = False
+        # Result of the last logged flight for panel / log window (D12).
+        self.last_result: Optional[dict] = None
+        # Sessions this process saw end (logged, closed or cancelled): session_key →
+        # {"at", "flight_id", "result"}. Restore, the retry loop and the log window
+        # never bring such a session back (review S8).
+        self._ended_sessions: Dict[str, dict] = {}
+        self._clock_hinted: bool = False
+        self.restore_state: str = "idle"
+        self._panel_origin_seen: Optional[str] = None
+        self._panel_origin_rejected: Optional[dict] = None
         GROUND.start_def = self.config.hotkey_start
         GROUND.end_def = self.config.hotkey_end
         GROUND.volume = self.config.hotkey_volume
@@ -1848,6 +2410,13 @@ class AppState:
         self.log_lines = self.log_lines[-200:]
         print(line)
         self.last_message = msg
+
+    def log_only(self, msg: str) -> None:
+        """Log line that never becomes the status text of panel/app (bridge noise)."""
+        line = f"[{datetime.now().strftime('%H:%M:%S')}] {msg}"
+        self.log_lines.append(line)
+        self.log_lines = self.log_lines[-200:]
+        print(line)
 
     def _fuel_pump_fields(self) -> dict:
         job = self._gsx_refuel
@@ -1880,6 +2449,10 @@ class AppState:
         # Never call SimConnect from the UI thread — that froze "Flug beenden".
         if self.sim.connected:
             self.sim.ping_process()
+        # Version fields read disk + cached server values – never under STATE.lock
+        # (the monitor thread needs that lock every second, D12).
+        panel_fields = panel_snapshot_fields()
+        pending_start = self.pending_start if isinstance(self.pending_start, dict) else None
         with self.lock:
             sample = dict(self.last_sample) if (self.sim.connected and self.last_sample) else None
             elapsed = flight_elapsed_now()
@@ -1901,6 +2474,8 @@ class AppState:
             )
             if snap_reg and not snap_label:
                 snap_label = snap_reg
+            # start/end set sim_io_pause while they arm or close a flight – no flash
+            unrecorded = bool(self.active_flight_id and not self.monitoring and not self.sim_io_pause)
             return {
                 "ok": True,
                 "logged_in": bool(self.api.token),
@@ -1951,10 +2526,36 @@ class AppState:
                 "track_points_local": len(self.local_track) if self.monitoring else 0,
                 "mode": "end_of_flight",
                 "pending_end": bool(self.pending_end),
-                "pending_start": bool(self.pending_start),
+                "pending_start": bool(pending_start),
+                "pending_start_text": (
+                    t_ui("Start wartet – NICHT losfliegen", "Start queued – do NOT take off")
+                    if pending_start
+                    else ""
+                ),
+                "mismatch_kind": self._mismatch_kind if self._position_mismatch else "",
+                # Review S8: the server has a flight this client does not record
+                # (lost /start answer, no session on this PC) – only "Cancel" helps.
+                "flight_unrecorded": unrecorded,
+                "flight_unrecorded_text": (
+                    t_ui(
+                        "Flug läuft auf dem Server ohne Aufzeichnung – nur „Abbrechen“ hilft, dann neu starten.",
+                        "The server has a flight that is not being recorded – only “Cancel” helps, then start again.",
+                    )
+                    if unrecorded
+                    else ""
+                ),
+                "title_mismatch": bool(self._title_mismatch_ticks >= TITLE_CHANGE_TICKS),
+                "mismatch_choice_open": bool(
+                    self._position_mismatch and self._mismatch_kind == "gap" and not self._mismatch_choice
+                ),
+                "max_sim_rate": self.max_sim_rate,
+                "last_result": dict(self.last_result) if self.last_result else None,
+                "clock_offset_sec": round(SERVER_CLOCK.raw_ms / 1000.0, 1) if SERVER_CLOCK.known else None,
+                "sim_read_ms": dict(self.sim.read_stats),
+                "restore_state": self.restore_state,
                 "hotkeys": GROUND.snapshot(),
                 **self._fuel_pump_fields(),
-                **panel_snapshot_fields(),
+                **panel_fields,
             }
 
 
@@ -2034,7 +2635,9 @@ def _file_version(path: Path) -> Optional[str]:
 
 def ensure_updater_install() -> None:
     """Push a fixed updater onto 1.0.2 boxes without using its broken self-update."""
-    refresh_panel_latest()
+    refresh_versions(blocking=True)
+    if not STATE._versions_ok:
+        return  # without fresh versions.json we would push blindly – wait
     latest = str(STATE._updater_push or UPDATER_PUSH_FALLBACK).strip()
     exe = Path(os.environ.get("LOCALAPPDATA") or "") / "FlyConomyUpdater" / "FlyConomyUpdater.exe"
     current = _file_version(exe) or "0"
@@ -2046,6 +2649,9 @@ def ensure_updater_install() -> None:
     r.raise_for_status()
     if len(r.content) < 10_000:
         raise RuntimeError("updater download too small")
+    expected = str((STATE._download_hashes or {}).get(url.rsplit("/", 1)[-1]) or "").strip().lower()
+    if expected and hashlib.sha256(r.content).hexdigest() != expected:
+        raise RuntimeError("updater download: SHA-256 stimmt nicht mit versions.json überein")
     setup.write_bytes(r.content)
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.Popen(
@@ -2112,41 +2718,100 @@ def scan_installed_panel_version() -> Optional[str]:
     return max(found, key=version_tuple) if found else None
 
 
-def refresh_panel_latest() -> str:
-    now = time.time()
-    if STATE._panel_latest_at and now - STATE._panel_latest_at < 600:
-        return STATE._panel_latest
-    url = f"{SITE_URL}/api/live/versions.json"
+VERSIONS_URL = f"{SITE_URL}/api/live/versions.json"
+VERSIONS_REFRESH_SEC = 600
+VERSIONS_RETRY_SEC = 60  # after a failed fetch (D12: was 600)
+_VERSION_RE = re.compile(r"^\d+(?:\.\d+){0,3}$")
+
+
+def _version_field(data: dict, *keys: str) -> str:
+    for key in keys:
+        raw = str((data or {}).get(key) or "").strip()
+        if raw and _VERSION_RE.match(raw):
+            return raw
+    return ""
+
+
+def apply_versions_payload(data: dict) -> None:
+    """versions.json → state. New fields first, old fields as fallback.
+
+    Old servers only send "client"/"panel"; for 2.11.12 those were both the gate
+    and the newest version, so they stand in for clientMin/panelMin as well.
+    """
+    if not isinstance(data, dict):
+        return
+    panel_latest = _version_field(data, "panelLatest", "panel", "latest")
+    client_latest = _version_field(data, "clientLatest", "client")
+    client_min = _version_field(data, "clientMin", "client")
+    panel_min = _version_field(data, "panelMin", "panel", "latest")
+    if panel_latest:
+        STATE._panel_latest = panel_latest
+    if client_latest:
+        STATE._client_latest = client_latest
+    if client_min:
+        STATE._client_min = client_min
+    if panel_min:
+        STATE._panel_min = panel_min
+    dl = str(data.get("panelUrl") or data.get("url") or "").strip()
+    cdl = str(data.get("clientUrl") or "").strip()
+    if dl:
+        STATE._panel_download = dl
+    if cdl:
+        STATE._client_download = cdl
+    push = _version_field(data, "updaterCurrent", "updater")
+    uurl = str(data.get("updaterUrl") or "").strip()
+    if push:
+        STATE._updater_push = push
+    if uurl:
+        STATE._updater_url = uurl
+    hashes = data.get("hashes")
+    if isinstance(hashes, dict):
+        STATE._download_hashes = {str(k): str(v) for k, v in hashes.items() if isinstance(v, str)}
+    feats = data.get("clientFeatures")
+    if isinstance(feats, dict):
+        STATE._server_features = dict(feats)
+
+
+def _refresh_versions_worker() -> None:
+    ok = False
     try:
-        r = requests.get(url, timeout=4)
-        if r.ok:
-            data = r.json() if "json" in (r.headers.get("content-type") or "") else {}
-            panel = str((data or {}).get("panel") or (data or {}).get("latest") or "").strip()
-            client = str((data or {}).get("client") or "").strip()
-            dl = str((data or {}).get("panelUrl") or (data or {}).get("url") or "").strip()
-            cdl = str((data or {}).get("clientUrl") or "").strip()
-            if panel:
-                STATE._panel_latest = panel
-            if client:
-                STATE._client_latest = client
-            if dl:
-                STATE._panel_download = dl
-            if cdl:
-                STATE._client_download = cdl
-            push = str((data or {}).get("updaterCurrent") or (data or {}).get("updater") or "").strip()
-            uurl = str((data or {}).get("updaterUrl") or "").strip()
-            if push:
-                STATE._updater_push = push
-            if uurl:
-                STATE._updater_url = uurl
-            feats = (data or {}).get("clientFeatures")
-            if isinstance(feats, dict):
-                # hotfix 2.11.12.1: server switches, only bridge_* are read
-                BRIDGE_SERVER_FEATURES.clear()
-                BRIDGE_SERVER_FEATURES.update(feats)
-            STATE._panel_latest_at = now
+        r = STATE.api._req("GET", VERSIONS_URL, timeout=6)
+        if r.status_code == 200:
+            data = r.json()
+            if isinstance(data, dict):
+                apply_versions_payload(data)
+                ok = True
     except Exception:
+        ok = False
+    finally:
+        now = time.time()
+        STATE._versions_ok = ok or STATE._versions_ok
+        STATE._versions_next_at = now + (VERSIONS_REFRESH_SEC if ok else VERSIONS_RETRY_SEC)
         STATE._panel_latest_at = now
+        STATE._versions_busy = False
+
+
+def refresh_versions(blocking: bool = False) -> None:
+    """Fetch versions.json at most every 10 min (1 min after an error).
+
+    Not blocking by default: the panel polls /status every 1.2 s and the
+    snapshot must never wait for the network.
+    """
+    if time.time() < STATE._versions_next_at or STATE._versions_busy:
+        return
+    STATE._versions_busy = True
+    if blocking:
+        _refresh_versions_worker()
+        return
+    try:
+        threading.Thread(target=_refresh_versions_worker, daemon=True, name="fc-versions").start()
+    except Exception:
+        STATE._versions_busy = False
+
+
+def refresh_panel_latest() -> str:
+    """Compatibility wrapper (older call sites): background refresh, cached value."""
+    refresh_versions()
     return STATE._panel_latest
 
 
@@ -2159,27 +2824,42 @@ def note_panel_version(ver: str) -> None:
 
 
 def panel_status() -> dict:
+    """Versions for panel, website and the start gate (D12).
+
+    *_outdated  = below clientMin/panelMin → starting is blocked (old meaning kept,
+                  the website and old panels read these two flags).
+    *_update_available = below clientLatest/panel latest → only a hint.
+    """
     now = time.time()
     if now - STATE._panel_disk_at > 20:
-        STATE.panel_version_disk = scan_installed_panel_version()
         STATE._panel_disk_at = now
-    latest = refresh_panel_latest()
+        try:
+            STATE.panel_version_disk = scan_installed_panel_version()
+        except Exception:
+            pass
+    refresh_versions()
+    latest = STATE._panel_latest
     live_ok = bool(STATE.panel_version_live) and (now - STATE.panel_live_at) < 90
     installed = bool(STATE.panel_version_disk) or live_ok
     current = STATE.panel_version_live if live_ok else STATE.panel_version_disk
-    outdated = bool(
-        installed and current and version_tuple(current) < version_tuple(latest)
-    )
-    client_outdated = version_tuple(CLIENT_VERSION) < version_tuple(STATE._client_latest)
+    panel_min = STATE._panel_min
+    panel_blocked = bool(installed and current and version_tuple(current) < version_tuple(panel_min))
+    panel_update = bool(installed and current and version_tuple(current) < version_tuple(latest))
+    client_blocked = version_tuple(CLIENT_VERSION) < version_tuple(STATE._client_min)
+    client_update = version_tuple(CLIENT_VERSION) < version_tuple(STATE._client_latest)
     return {
         "panel_installed": installed,
         "panel_version": current,
         "panel_latest": latest,
-        "panel_outdated": outdated,
+        "panel_min": panel_min,
+        "panel_outdated": panel_blocked,
+        "panel_update_available": panel_update,
         "panel_download_url": STATE._panel_download,
         "client_version": CLIENT_VERSION,
         "client_latest": STATE._client_latest,
-        "client_outdated": client_outdated,
+        "client_min": STATE._client_min,
+        "client_outdated": client_blocked,
+        "client_update_available": client_update,
         "client_download_url": STATE._client_download,
     }
 
@@ -2192,13 +2872,107 @@ def panel_snapshot_fields() -> dict:
             "panel_installed": False,
             "panel_version": None,
             "panel_latest": PANEL_FALLBACK_LATEST,
+            "panel_min": PANEL_FALLBACK_MIN,
             "panel_outdated": False,
+            "panel_update_available": False,
             "panel_download_url": f"{SITE_URL}/downloads/FlyConomy-MSFS-Panel.zip",
             "client_version": CLIENT_VERSION,
             "client_latest": CLIENT_FALLBACK_LATEST,
+            "client_min": CLIENT_FALLBACK_MIN,
             "client_outdated": False,
+            "client_update_available": False,
             "client_download_url": f"{SITE_URL}/downloads/FlyConomyMiniClient_Setup.exe",
         }
+
+
+def version_gate_message(info: dict) -> Optional[str]:
+    """None when starting is allowed, else the German/English reason."""
+    parts = []
+    if info.get("client_outdated"):
+        parts.append(
+            t_ui(
+                f"Client {CLIENT_VERSION} ist zu alt, mindestens {info.get('client_min')} ist nötig.",
+                f"Client {CLIENT_VERSION} is too old, at least {info.get('client_min')} is required.",
+            )
+        )
+    if info.get("panel_outdated"):
+        parts.append(
+            t_ui(
+                f"MSFS-Panel {info.get('panel_version')} ist zu alt, mindestens {info.get('panel_min')} ist nötig.",
+                f"MSFS panel {info.get('panel_version')} is too old, at least {info.get('panel_min')} is required.",
+            )
+        )
+    if not parts:
+        return None
+    return " ".join(parts) + " " + t_ui(
+        "Bitte zuerst unter Downloads aktualisieren.",
+        "Please update via Downloads first.",
+    )
+
+
+def assert_start_allowed() -> None:
+    """One gate for bridge, desktop UI, hotkey, gateway and queued starts (D12)."""
+    info = panel_snapshot_fields()
+    msg = version_gate_message(info)
+    if msg:
+        raise VersionGateError(msg, info)
+
+
+FEATURE_DEFAULTS = {
+    # Real pause detection via the Pause_EX1 event – off until test flights (D9).
+    "pause_ex1": False,
+    # Bridge accepts browsers only from the panel (coui://) and its own pages (D11).
+    "bridge_origin_check": True,
+    # Offer "back to the last position" after a restart/crash (D1).
+    "reposition_offer": True,
+    # Bridge answers only requests addressed to 127.0.0.1/localhost (DNS rebinding).
+    "bridge_host_check": True,
+    # Send the far position (suspect + recent_samples) while the "gap" question is
+    # open. Off until the server ignores paused samples for its teleport check
+    # (C6); until then such pings can make the server end the flight (review S8).
+    "suspect_report": False,
+    # Pause the recording while another aircraft (TITLE) is loaded. Off until the
+    # beta confirmed it (livery changes); 2.11.12 had no such pause.
+    "title_pause": False,
+}
+
+
+def feature_enabled(name: str) -> bool:
+    """ini override (beta testers) → /start client_features → versions.json → default."""
+    try:
+        override = STATE.config.feature_override(name)
+    except Exception:
+        override = None
+    if override is not None:
+        return override
+    for source in (getattr(STATE, "_flight_features", None), getattr(STATE, "_server_features", None)):
+        if isinstance(source, dict) and name in source:
+            return bool(source.get(name))
+    return bool(FEATURE_DEFAULTS.get(name, False))
+
+
+def note_clock_skew() -> None:
+    """Hint once when the PC clock is a minute or more off (D5)."""
+    if STATE._clock_hinted or not SERVER_CLOCK.known:
+        return
+    raw = SERVER_CLOCK.raw_ms
+    if abs(raw) < ServerClock.HINT_MS:
+        return
+    STATE._clock_hinted = True
+    mins = abs(raw) / 60000.0
+    ahead = raw < 0  # server behind the PC → PC clock runs ahead
+    de = (
+        f"Die Uhr dieses PCs geht etwa {mins:.0f} min {'vor' if ahead else 'nach'}. "
+        "FlyConomy gleicht das beim Aufzeichnen aus. Bitte trotzdem in Windows "
+        "„Uhrzeit automatisch festlegen“ einschalten."
+    )
+    en = (
+        f"This PC's clock is about {mins:.0f} min {'ahead' if ahead else 'behind'}. "
+        "FlyConomy compensates while recording. Please still enable "
+        "“Set time automatically” in Windows."
+    )
+    STATE.log(t_ui(de, en))
+    notify_windows("FlyConomy – PC-Uhr", t_ui(de, en), code="FC-CLOCK", kind="info")
 
 
 def notify_windows(title: str, message: str, code: str = "", kind: str = "error") -> None:
@@ -2248,27 +3022,167 @@ def validation_route_icaos(result: Optional[dict]) -> tuple[str, str]:
     return str(from_icao or "?").upper(), str(to_icao or "?").upper()
 
 
-def notify_flight_logged(result: dict) -> None:
-    validation = (result or {}).get("validation") or {}
-    status = str(validation.get("status") or result.get("message") or "OK")
-    pay = result.get("total_payment")
+def _money_num(val: Any) -> Optional[float]:
+    try:
+        n = float(val)
+    except (TypeError, ValueError):
+        return None
+    return n if math.isfinite(n) else None
+
+
+def _usd(n: float, signed: bool = False) -> str:
+    whole = int(round(n))
+    txt = f"${abs(whole):,}".replace(",", ".")
+    if signed:
+        return ("+" if whole >= 0 else "−") + txt
+    return ("−" if whole < 0 else "") + txt
+
+
+def _undelivered_list(result: dict) -> List[dict]:
+    raw = (result or {}).get("undelivered_jobs") or (result or {}).get("undelivered_assignments") or []
+    out: List[dict] = []
+    if not isinstance(raw, list):
+        return out
+    for job in raw:
+        if isinstance(job, dict):
+            out.append(job)
+        elif job is not None:
+            out.append({"id": job})
+    return out
+
+
+def end_result_summary(result: dict) -> dict:
+    """Net result and undelivered jobs (D12). Works with old and new servers:
+    net_change / fuel_charged / undelivered_jobs come with C12, otherwise the
+    paid amount (already net of airport fees, rent and Sky-Tab) is shown."""
+    result = result or {}
+    validation = result.get("validation") or {}
     from_icao, to_icao = validation_route_icaos(result)
+    paid = _money_num(result.get("total_payment"))
+    net = _money_num(result.get("net_change"))
+    # Server stage C (fixer): pilot_pay / airport_fees_pilot / rental_pilot are the pilot's OWN
+    # amounts. airport_fees / rental_charged are the totals, which the airline, the owner group
+    # or the crew may have paid – with own amounts the lines add up to net_change.
+    pilot_pay = _money_num(result.get("pilot_pay"))
+    own = pilot_pay is not None
+    deductions = []
+    for key, own_key, de, en in (
+        ("airport_fees", "airport_fees_pilot", "Flughafengebühren", "Airport fees"),
+        ("rental_charged", "rental_pilot", "Miete", "Rent"),
+        ("fuel_charged", None, "Treibstoff", "Fuel"),
+        ("sky_tab_garnished", None, "Sky-Tab", "Sky tab"),
+    ):
+        n = _money_num(result.get(own_key if (own and own_key) else key))
+        if n:
+            deductions.append({"key": key, "label": t_ui(de, en), "amount": n})
+    other = None
+    if own and net is not None:
+        rest = net - (pilot_pay - sum(abs(d["amount"]) for d in deductions))
+        if abs(rest) >= 1:
+            other = rest  # e.g. the FBO share of the airport fees for an FBO tenant
+    undelivered = []
+    for job in _undelivered_list(result)[:20]:
+        undelivered.append(
+            {
+                "id": job.get("id") or job.get("assignment_id"),
+                "to": str(job.get("to_icao") or job.get("toIcao") or job.get("destination") or "").upper(),
+                "reason": str(job.get("reason_text") or job.get("reason") or "").strip()[:160],
+            }
+        )
+    return {
+        "flight_id": result.get("flight_id") or (result.get("flight") or {}).get("id"),
+        "from": from_icao,
+        "to": to_icao,
+        "status": str(validation.get("status") or "OK"),
+        "paid": paid,
+        "gross": pilot_pay if own else _money_num(result.get("gross_payment")),
+        "gross_total": _money_num(result.get("gross_payment")),
+        "own_share": own,
+        "other": other,
+        "net": net,
+        "deductions": deductions,
+        "undelivered": undelivered,
+        "delivered": result.get("delivered_assignments"),
+        "already_logged": bool(result.get("already_logged")),
+        "crew": bool(result.get("crew")),
+        "message": str(result.get("message") or "")[:300],
+        "at": int(time.time()),
+    }
+
+
+def end_result_lines(result: dict) -> List[str]:
+    s = end_result_summary(result)
+    lines = [f"{s['from']} → {s['to']}", t_ui(f"Status: {s['status']}", f"Status: {s['status']}")]
+    if s["already_logged"]:
+        lines.append(
+            t_ui(
+                "Der Flug war schon gebucht (die erste Antwort ging unterwegs verloren).",
+                "The flight was already booked (the first answer got lost).",
+            )
+        )
+    if s["gross"] is not None and (s["deductions"] or s["other"] is not None):
+        if s["own_share"]:
+            total = s["gross_total"]
+            extra = ""
+            if total is not None and int(round(total)) != int(round(s["gross"])):
+                extra = t_ui(f" (Auftragslohn gesamt: {_usd(total)})", f" (total job pay: {_usd(total)})")
+            lines.append(
+                t_ui(f"Dein Lohnanteil: {_usd(s['gross'])}", f"Your pay share: {_usd(s['gross'])}") + extra
+            )
+        else:
+            lines.append(t_ui(f"Auftragslohn: {_usd(s['gross'])}", f"Job pay: {_usd(s['gross'])}"))
+        for d in s["deductions"]:
+            lines.append(f"  {d['label']}: −{_usd(abs(d['amount']))}")
+        if s["other"] is not None:
+            lines.append(
+                t_ui(f"  Sonstiges (z. B. FBO-Anteil): {_usd(s['other'], True)}", f"  Other (e.g. FBO share): {_usd(s['other'], True)}")
+            )
+    if s["net"] is not None:
+        lines.append(
+            t_ui(f"Netto auf deinem Konto: {_usd(s['net'], True)}", f"Net on your account: {_usd(s['net'], True)}")
+        )
+    elif s["paid"] is not None:
+        lines.append(t_ui(f"Ausgezahlt (netto): {_usd(s['paid'])}", f"Paid out (net): {_usd(s['paid'])}"))
+    if s["undelivered"]:
+        lines.append(
+            t_ui(
+                f"Nicht geliefert: {len(s['undelivered'])} Auftrag/Aufträge",
+                f"Not delivered: {len(s['undelivered'])} job(s)",
+            )
+        )
+        for job in s["undelivered"][:5]:
+            label = f"#{job['id']}" if job.get("id") is not None else "?"
+            dest = f" → {job['to']}" if job.get("to") else ""
+            why = f": {job['reason']}" if job.get("reason") else ""
+            lines.append(f"  {label}{dest}{why}")
+        if len(s["undelivered"]) > 5:
+            lines.append(t_ui(f"  … und {len(s['undelivered']) - 5} weitere", f"  … and {len(s['undelivered']) - 5} more"))
+    return lines
+
+
+def remember_end_result(result: dict) -> None:
+    try:
+        STATE.last_result = end_result_summary(result)
+    except Exception:
+        STATE.last_result = None
+
+
+def notify_flight_logged(result: dict) -> None:
     reg = STATE.economy_registration or STATE.registration or ""
-    pay_txt = f"${pay}" if pay is not None else "-"
-    lines = [
-        "Flug wurde geloggt.",
-        f"Ziel: {to_icao}" + (f" (von {from_icao})" if from_icao != "?" else ""),
-    ]
+    lines = [t_ui("Flug wurde geloggt.", "Flight logged.")]
+    lines.extend(end_result_lines(result))
     if reg:
-        lines.append(f"Kennung: {reg}")
-    lines.append(f"Status: {status}")
-    lines.append(f"Belohnung: {pay_txt}")
+        lines.append(t_ui(f"Kennung: {reg}", f"Registration: {reg}"))
     lines.append("")
-    lines.append("OK schliesst dieses Fenster.")
-    notify_windows("FlyConomy – Flug geloggt", "\n".join(lines), code="", kind="ok")
+    lines.append(t_ui("OK schliesst dieses Fenster.", "OK closes this window."))
+    notify_windows(
+        t_ui("FlyConomy – Flug geloggt", "FlyConomy – Flight logged"),
+        "\n".join(lines),
+        code="",
+        kind="ok",
+    )
 
 
-MAX_SIM_RATE = 16.0
 PARK_TICKS_TO_END = 2  # ~2s handbrake before auto-end (was 5 → felt like FSE lag)
 # Instant relocate / World-Map jump (nm). Real 16× hitch catch-up can be 80–180 nm
 # in one SimConnect tick after the sim stuttered — that is not a map click.
@@ -2291,6 +3205,17 @@ RESUME_FUEL_RISE_GAL = 2.0
 TELEPORT_CONFIRM_TICKS = 2
 SIMRATE_CONFIRM_TICKS = 3
 TAMPER_CONFIRM_HITS = 3
+# D8/D9 (2.11.13): position alone never cancels a flight. A gap is assumed only
+# after 3 failed reads; a stale link is rebuilt after 20 s without data.
+SIM_MISS_GAP_TICKS = 3
+SIM_GAP_FORCE_RECONNECT_SEC = 20.0
+RESUME_SPEED_FACTOR = 1.35
+MAX_PLAUSIBLE_GS_KT = 2000.0
+JUMP_CONSISTENT_TICKS = 3  # plausible samples after a jump before recording goes on
+MISMATCH_RETURN_NM = RESUME_TOLERANCE_NM
+SUSPECT_SAMPLES_KEEP = 20
+TITLE_CHANGE_TICKS = 3  # other aircraft / avatar mode: pause like a data gap
+GAP_CONFIRM_TICKS = 2  # samples after a gap that must agree before a "gap" question / fuel verdict
 
 
 def ui_locale() -> str:
@@ -2419,16 +3344,38 @@ def _clear_flight_runtime() -> None:
     STATE._refuel_grace_until = 0.0
     STATE._was_airborne = False
     STATE._max_nm_from_origin = 0.0
+    STATE.max_sim_rate = MAX_SIM_RATE
+    STATE.fuel_policy = {}
+    STATE._flight_features = {}
+    STATE._max_gs_seen = 0.0
+    STATE._flight_title = ""
+    STATE._title_mismatch_ticks = 0
+    STATE._fuel_report_due = None
+    STATE._read_misses = 0
+    STATE._gap_reason = ""
+    STATE._gap_wall_since = 0.0
+    STATE._restored_session = False
+    STATE._gap_confirm = 0
+    STATE._gap_fuel_confirm = 0
+    STATE._title_change_logged = False
+    _clear_mismatch()
     STATE.ui_status = ""
     with STATE.lock:
         STATE.local_track = []
         STATE.session_key = None
         STATE.track_seq = 0
-    try:
-        if os.path.exists(FLIGHT_SESSION_PATH):
-            os.remove(FLIGHT_SESSION_PATH)
-    except Exception:
-        pass
+    remove_file_and_bak(FLIGHT_SESSION_PATH)
+
+
+def _clear_mismatch() -> None:
+    STATE._position_mismatch = False
+    STATE._mismatch_kind = ""
+    STATE._mismatch_ref = None
+    STATE._mismatch_consistent = 0
+    STATE._mismatch_prompted = False
+    STATE._mismatch_choice = ""
+    STATE._mismatch_reported = False
+    STATE._mismatch_allowed_nm = 0.0
 
 
 def flight_elapsed_now() -> int:
@@ -2558,9 +3505,15 @@ def local_end_block_reason() -> Optional[str]:
     return hit[1] if hit else None
 
 
-def ping_paused_tracking(raw: dict) -> None:
+def _monitoring_active() -> bool:
+    return bool(STATE.monitoring and STATE.session_key and STATE.active_flight_id)
+
+
+def ping_paused_tracking(raw: dict, extra: Optional[dict] = None, *, force: bool = False) -> None:
+    """Live ping with paused=True (no track point). The server still runs its own
+    checks on it – that is where a suspicious position gets decided (D8)."""
     now_t = time.time()
-    if (now_t - float(STATE._live_last or 0)) < LIVE_POS_SEC:
+    if not force and (now_t - float(STATE._live_last or 0)) < LIVE_POS_SEC:
         return
     if not STATE.session_key or not STATE.active_flight_id:
         return
@@ -2571,25 +3524,116 @@ def ping_paused_tracking(raw: dict) -> None:
     if not sample:
         return
     STATE._live_last = now_t
+    body = {
+        "flight_id": STATE.active_flight_id,
+        "session_key": STATE.session_key,
+        "latitude": sample["latitude"],
+        "longitude": sample["longitude"],
+        "altitude": sample.get("altitude"),
+        "ground_speed": sample.get("ground_speed"),
+        "heading": sample.get("heading"),
+        "fuel_total": sample.get("fuel_total"),
+        "total_weight_lb": sample.get("total_weight_lb"),
+        "on_ground": sample.get("on_ground"),
+        "simulation_rate": sample.get("simulation_rate"),
+        "paused": True,
+    }
+    if extra:
+        body.update(extra)
     try:
-        STATE.api.tracking(
-            {
-                "flight_id": STATE.active_flight_id,
-                "session_key": STATE.session_key,
-                "latitude": sample["latitude"],
-                "longitude": sample["longitude"],
-                "altitude": sample.get("altitude"),
-                "ground_speed": sample.get("ground_speed"),
-                "heading": sample.get("heading"),
-                "fuel_total": sample.get("fuel_total"),
-                "total_weight_lb": sample.get("total_weight_lb"),
-                "on_ground": sample.get("on_ground"),
-                "simulation_rate": sample.get("simulation_rate"),
-                "paused": True,
-            }
-        )
+        STATE.api.tracking(body)
+    except ServerRejectedError as e:
+        server_ended_flight(str(e))
     except Exception:
         pass
+
+
+def note_recent_sample(raw: dict) -> None:
+    """Last ~20 raw samples – sent to the server with a suspicion (D8)."""
+    try:
+        STATE._recent_samples.append(
+            {
+                "t": now_ms(),
+                "lat": round(float(raw["latitude"]), 6),
+                "lon": round(float(raw["longitude"]), 6),
+                "alt": round(_finite(raw.get("altitude")), 1),
+                "gs": round(_finite(raw.get("ground_speed")), 1),
+                "on_ground": bool(raw.get("on_ground")),
+                "rate": round(_finite(raw.get("simulation_rate"), 1.0), 2),
+                "paused": bool(raw.get("paused")),
+            }
+        )
+        del STATE._recent_samples[:-SUSPECT_SAMPLES_KEEP]
+    except (KeyError, TypeError, ValueError):
+        pass
+
+
+def report_position_suspect(kind: str, raw: dict, extra: Optional[dict] = None) -> None:
+    STATE._mismatch_reported = True
+    payload = {
+        "suspect": {"kind": kind, **(extra or {})},
+        "recent_samples": list(STATE._recent_samples[-SUSPECT_SAMPLES_KEEP:]),
+    }
+    ping_paused_tracking(raw, payload, force=True)
+
+
+def ping_mismatch_ref(*, force: bool = False) -> None:
+    """Heartbeat (paused) at the last good point while the "gap" question is open.
+
+    Keeps the flight alive on the server without sending the far position: the
+    deploy-1 heartbeat counts teleport strikes on paused pings as well."""
+    ref = STATE._mismatch_ref or {}
+    try:
+        lat = float(ref["latitude"])
+        lon = float(ref["longitude"])
+    except (KeyError, TypeError, ValueError):
+        return
+    now_t = time.time()
+    if not force and (now_t - float(STATE._live_last or 0)) < LIVE_POS_SEC:
+        return
+    if not STATE.session_key or not STATE.active_flight_id:
+        return
+    STATE._live_last = now_t
+    fuel = _finite(ref.get("fuel_total"))
+    weight = _finite(ref.get("total_weight_lb"))
+    body = {
+        "flight_id": STATE.active_flight_id,
+        "session_key": STATE.session_key,
+        "latitude": lat,
+        "longitude": lon,
+        "altitude": _finite(ref.get("altitude")),
+        "ground_speed": max(0.0, _finite(ref.get("ground_speed"))),
+        "heading": _finite(ref.get("heading")),
+        "fuel_total": fuel if fuel > 0 else None,
+        "total_weight_lb": weight if weight > 0 else None,
+        "on_ground": bool(ref.get("on_ground")),
+        "simulation_rate": max(1.0, _finite(ref.get("simulation_rate"), 1.0)),
+        "paused": True,
+        "position_wait": True,
+    }
+    try:
+        STATE.api.tracking(body)
+    except ServerRejectedError as e:
+        server_ended_flight(str(e))
+    except Exception:
+        pass
+
+
+def server_ended_flight(reason: str) -> None:
+    """The server closed the flight (its verdict). Never relabel it as a local abort."""
+    if not STATE.monitoring and not STATE.active_flight_id:
+        return
+    reason = str(reason or "").strip() or t_ui("ohne Angabe", "no reason given")
+    msg = t_ui(f"Der Server hat den Flug beendet: {reason}", f"The server ended the flight: {reason}")
+    _clear_flight_runtime()
+    STATE.last_error = msg
+    STATE.log(msg)
+    notify_windows(
+        t_ui("FlyConomy – Flug beendet", "FlyConomy – Flight ended"),
+        msg,
+        code="FC-SERVER-ENDED",
+        kind="abort",
+    )
 
 
 def sample_plausible(sample: dict) -> bool:
@@ -2604,15 +3648,21 @@ def sample_plausible(sample: dict) -> bool:
     return not (abs(lat) < 0.01 and abs(lon) < 0.01)
 
 
-def note_sim_gap() -> None:
+_GAP_RANK = {"": 0, "data": 1, "title": 2, "disconnected": 3, "process": 4, "restore": 5}
+
+
+def note_sim_gap(reason: str = "data") -> None:
     """No usable sim data: pause the recording, reconnect, keep the flight."""
     now = time.time()
     if not STATE._sim_gap_since:
         STATE._sim_gap_since = now
         STATE._sim_gap_retry_at = now + 4.0
+    if not STATE._gap_wall_since:
+        STATE._gap_wall_since = now
+    if _GAP_RANK.get(reason, 1) > _GAP_RANK.get(STATE._gap_reason, 0):
+        STATE._gap_reason = reason
     begin_tracking_pause("gap")
-    gap = now - STATE._sim_gap_since
-    if not STATE._sim_gap_hinted and gap >= SIM_GAP_HINT_SEC:
+    if not STATE._sim_gap_hinted and (now - STATE._gap_wall_since) >= SIM_GAP_HINT_SEC:
         STATE._sim_gap_hinted = True
         STATE.log(
             t_ui(
@@ -2624,12 +3674,19 @@ def note_sim_gap() -> None:
         )
     if now >= STATE._sim_gap_retry_at:
         STATE._sim_gap_retry_at = now + SIM_GAP_RECONNECT_SEC
-        if _msfs_process_running() and not STATE.sim.connected:
-            try:
-                STATE.sim.connect()
-            except Exception:
-                pass
-    if gap >= SIM_GAP_ABANDON_SEC:
+        if _msfs_process_running():
+            # Connected but silent for 20 s: the link is stale, build it anew (D9).
+            stale = (
+                STATE.sim.connected
+                and reason == "data"
+                and (now - STATE._gap_wall_since) >= SIM_GAP_FORCE_RECONNECT_SEC
+            )
+            if not STATE.sim.connected or stale:
+                try:
+                    STATE.sim.connect()
+                except Exception:
+                    pass
+    if now - STATE._gap_wall_since >= SIM_GAP_ABANDON_SEC:
         abort_active_flight("abandoned")
 
 
@@ -2673,24 +3730,72 @@ def allowed_move_nm(dt_sec: float, *rates: object, gs_kt: float = 0.0) -> float:
     return max(floor, raw)
 
 
-def allowed_resume_nm(dt_sec: float, *rates: object) -> float:
+def note_max_gs(gs: object) -> None:
+    n = _finite(gs, 0.0)
+    if 0.0 < n <= MAX_PLAUSIBLE_GS_KT and n > float(STATE._max_gs_seen or 0.0):
+        STATE._max_gs_seen = n
+
+
+def resume_speed_kt() -> float:
+    """Speed a gap may explain – from the aircraft, not one number for all (D8).
+
+    Flight 1308 (Concorde, ~1,175 kt) was measured against 620 kt × 1.35."""
+    best = RESUME_SPEED_KT
+    seen = _finite(STATE._max_gs_seen, 0.0)
+    if 0.0 < seen <= MAX_PLAUSIBLE_GS_KT:
+        best = max(best, seen * RESUME_SPEED_FACTOR)
+    load = STATE.load_info or {}
+    cruise = _finite(load.get("cruise_speed") or load.get("cruise_kt"), 0.0)
+    if 0.0 < cruise <= MAX_PLAUSIBLE_GS_KT:
+        best = max(best, cruise * RESUME_SPEED_FACTOR)
+    return best
+
+
+def allowed_resume_nm(dt_sec: float, *rates: object, speed_kt: Optional[float] = None) -> float:
     """How far the aircraft may have flown during a pause or SimConnect gap."""
-    return max(RESUME_TOLERANCE_NM, allowed_move_nm(dt_sec, *rates, gs_kt=RESUME_SPEED_KT))
+    speed = float(speed_kt) if speed_kt else resume_speed_kt()
+    return max(RESUME_TOLERANCE_NM, allowed_move_nm(dt_sec, *rates, gs_kt=speed))
+
+
+def _pos_ref(sample: dict, t: Optional[int] = None) -> dict:
+    return {
+        "latitude": float(sample["latitude"]),
+        "longitude": float(sample["longitude"]),
+        "altitude": _finite(sample.get("altitude")),
+        "heading": _finite(sample.get("heading")),
+        "ground_speed": _finite(sample.get("ground_speed")),
+        "on_ground": bool(sample.get("on_ground")),
+        "fuel_total": _finite(sample.get("fuel_total")),
+        "total_weight_lb": _finite(sample.get("total_weight_lb") or sample.get("total_weight")),
+        "simulation_rate": _finite(sample.get("simulation_rate"), 1.0),
+        "t": int(t if t is not None else now_ms()),
+    }
+
+
+def _close_sim_gap() -> None:
+    STATE._sim_gap_since = 0.0
+    STATE._sim_gap_hinted = False
+    STATE._sim_gap_retry_at = 0.0
+    STATE._gap_wall_since = 0.0
+    STATE._gap_reason = ""
+    STATE._restored_session = False
+    STATE._gap_confirm = 0
+    STATE._gap_fuel_confirm = 0
 
 
 def resume_after_gap(sample: dict) -> None:
     """Sim data is back – continue when the aircraft simply stayed where it was.
 
-    A gap can never be used to skip ahead: position and fuel have to line up with
-    the state before the gap, otherwise the recording stays paused instead of
-    silently accepting a reloaded or refuelled aircraft.
+    A gap can never be used to skip ahead, but since 2.11.13 the position alone
+    never cancels the flight either (Q32): the recording stays paused, the pilot
+    is asked, and the server gets the samples to decide.
     """
     gap = time.time() - STATE._sim_gap_since if STATE._sim_gap_since else 0.0
-    STATE._sim_gap_since = 0.0
-    STATE._sim_gap_hinted = False
-    STATE._sim_gap_retry_at = 0.0
+    reason = STATE._gap_reason or "data"
+    restored = bool(STATE._restored_session)
     ref = STATE._resume_ref or {}
     if gap < 5.0 or not ref:
+        _close_sim_gap()
         end_tracking_pause()
         return
     try:
@@ -2704,29 +3809,52 @@ def resume_after_gap(sample: dict) -> None:
         moved = 0.0
     # Time compression covers real ground: at 16× a 30 s gap is 8 minutes of flying.
     allowed = allowed_resume_nm(gap, ref.get("simulation_rate"), sample.get("simulation_rate"))
-    ref_fuel = _finite(ref.get("fuel_total"))
-    fuel = _finite(sample.get("fuel_total"))
     mins = gap / 60.0
     if moved > allowed:
-        STATE.log(
-            t_ui(
-                f"Nach der Pause ({mins:.0f} min) steht das Flugzeug {moved:.0f} nm vom letzten "
-                "Punkt entfernt – Versetzen. Flug wird abgebrochen.",
-                f"After the pause ({mins:.0f} min) the aircraft sits {moved:.0f} nm from the last "
-                "point – relocate. Flight is cancelled.",
-            )
+        # Review S8: one stray SimConnect coordinate right after a gap or restore
+        # must not park the flight in a question – the next sample has to agree.
+        STATE._gap_fuel_confirm = 0
+        STATE._gap_confirm += 1
+        if STATE._gap_confirm < GAP_CONFIRM_TICKS:
+            return  # the gap stays open, nothing is recorded from this sample
+        _close_sim_gap()
+        enter_position_mismatch(
+            "gap",
+            sample,
+            ref,
+            moved_nm=round(moved, 1),
+            allowed_nm=round(allowed, 1),
+            gap_sec=int(gap),
+            gap_reason="restore" if restored else reason,
         )
-        abort_active_flight("teleport")
         return
-    if (
+    STATE._gap_confirm = 0
+    ref_fuel = _finite(ref.get("fuel_total"))
+    fuel = _finite(sample.get("fuel_total"))
+    fuel_rose = (
         ref_fuel > 1.0
         and fuel > ref_fuel + RESUME_FUEL_RISE_GAL
         and not bool(sample.get("on_ground"))
         and not sim_fuel_unreliable()
-    ):
+    )
+    if fuel_rose and reason == "data" and not restored:
+        # Same sim session, only the data stream was gone: fuel cannot grow. A hard
+        # verdict needs a second sample (review S8) – one glitch reading is not enough.
+        STATE._gap_fuel_confirm += 1
+        if STATE._gap_fuel_confirm < GAP_CONFIRM_TICKS:
+            return
+        _close_sim_gap()
         abort_active_flight("fuel_tamper")
         return
-    STATE._position_mismatch = False
+    _close_sim_gap()
+    if fuel_rose:
+        # Client or MSFS restarted: the reloaded aircraft has its own fuel. Report it.
+        report_position_suspect(
+            "fuel_after_restart",
+            sample,
+            {"fuel_before": round(ref_fuel, 1), "fuel_now": round(fuel, 1), "gap_sec": int(gap)},
+        )
+    _clear_mismatch()
     now_t = time.time()
     STATE._integrity_last = {
         "fuel": _finite(sample.get("fuel_total")),
@@ -2737,7 +3865,7 @@ def resume_after_gap(sample: dict) -> None:
         "latitude": float(sample["latitude"]),
         "longitude": float(sample["longitude"]),
         "simulation_rate": _finite(sample.get("simulation_rate"), 1.0),
-        "t": int(now_t * 1000),
+        "t": now_ms(),
     }
     STATE._teleport_strikes = 0
     STATE._simrate_strikes = 0
@@ -2751,8 +3879,255 @@ def resume_after_gap(sample: dict) -> None:
     )
 
 
+def enter_position_mismatch(kind: str, raw: dict, ref: Optional[dict], **extra: Any) -> None:
+    """Pause the recording instead of cancelling (D8, Q32).
+
+    kind "gap":  after a restart/crash the aircraft is somewhere else – ask the pilot.
+    kind "jump": a jump while data kept coming – report it, go on once the new
+                 position is steady; the server decides about the flight.
+    """
+    first = not STATE._position_mismatch
+    STATE._position_mismatch = True
+    STATE._mismatch_kind = kind
+    if ref:
+        STATE._mismatch_ref = dict(ref)
+    STATE._mismatch_allowed_nm = _finite(extra.get("allowed_nm"))
+    STATE._mismatch_consistent = 0
+    STATE._mismatch_choice = ""
+    begin_tracking_pause("mismatch")
+    try:
+        STATE._last_pos = {
+            "latitude": float(raw["latitude"]),
+            "longitude": float(raw["longitude"]),
+            "simulation_rate": _finite(raw.get("simulation_rate"), 1.0),
+            "t": now_ms(),
+        }
+    except (KeyError, TypeError, ValueError):
+        pass
+    if not first:
+        return
+    moved = _finite(extra.get("moved_nm"))
+    if kind == "gap":
+        STATE.log(
+            t_ui(
+                f"Nach der Unterbrechung steht das Flugzeug {moved:.0f} nm vom letzten Punkt entfernt. "
+                "Der Flug ist NICHT abgebrochen – die Aufzeichnung wartet.",
+                f"After the interruption the aircraft is {moved:.0f} nm from the last point. "
+                "The flight is NOT cancelled – recording is waiting.",
+            )
+        )
+    else:
+        STATE.log(
+            t_ui(
+                f"Ungewöhnlicher Positionssprung ({moved:.0f} nm) – Aufzeichnung kurz pausiert, "
+                "der Server prüft. Der Flug läuft weiter.",
+                f"Unusual position jump ({moved:.0f} nm) – recording paused briefly, "
+                "the server checks it. The flight continues.",
+            )
+        )
+    if kind == "gap" and not feature_enabled("suspect_report"):
+        # Review S8: the server checks every ping (paused ones too) and far
+        # positions can make it end the flight – before the pilot can answer.
+        # While the question is open only the last good point goes out; the jump is
+        # reported once the pilot picks "fly on from here".
+        ping_mismatch_ref(force=True)
+    else:
+        report_position_suspect(kind, raw, {k: v for k, v in extra.items() if v is not None})
+    if kind == "gap" and STATE._position_mismatch:
+        prompt_position_choice()
+    _push_presence()
+
+
+def _resolve_mismatch(raw: dict, message: str) -> None:
+    _clear_mismatch()
+    try:
+        STATE._last_pos = {
+            "latitude": float(raw["latitude"]),
+            "longitude": float(raw["longitude"]),
+            "simulation_rate": _finite(raw.get("simulation_rate"), 1.0),
+            "t": now_ms(),
+        }
+        STATE._resume_ref = _pos_ref(raw)
+    except (KeyError, TypeError, ValueError):
+        pass
+    STATE._integrity_last = None
+    STATE._teleport_strikes = 0
+    end_tracking_pause()
+    STATE.log(message)
+    _push_presence()
+
+
+def prompt_position_choice() -> None:
+    """Ask once: back to the last point, fly on from here, or cancel (D1.3)."""
+    if STATE._mismatch_prompted:
+        return
+    STATE._mismatch_prompted = True
+    ref = STATE._mismatch_ref or {}
+    can_reposition = feature_enabled("reposition_offer") and bool(ref)
+    if ref.get("on_ground"):
+        where_de, where_en = "am Boden", "on the ground"
+    else:
+        alt = _finite(ref.get("altitude"))
+        where_de, where_en = f"in {alt:,.0f} ft".replace(",", "."), f"at {alt:,.0f} ft"
+    msg = t_ui(
+        f"Das Flugzeug steht nicht dort, wo die Aufzeichnung aufgehört hat (letzter Punkt {where_de}). "
+        "Der Flug ist NICHT abgebrochen – die Aufzeichnung wartet.\n\n"
+        + ("„Zur letzten Position“ setzt das Flugzeug dorthin zurück, danach geht es weiter.\n" if can_reposition else "")
+        + "„Hier weiterfliegen“ zeichnet ab hier weiter – der Server prüft dann den Sprung.\n"
+        "„Flug abbrechen“ beendet den Flug ohne Bezahlung.",
+        f"The aircraft is not where recording stopped (last point {where_en}). "
+        "The flight is NOT cancelled – recording is waiting.\n\n"
+        + ("“Back to last position” puts the aircraft there, then the flight goes on.\n" if can_reposition else "")
+        + "“Fly on from here” records from here – the server then checks the jump.\n"
+        "“Cancel flight” ends the flight without pay.",
+    )
+    choices = []
+    if can_reposition:
+        choices.append(("reposition", t_ui("Zur letzten Position", "Back to last position"), "primary"))
+    choices.append(("continue", t_ui("Hier weiterfliegen", "Fly on from here"), "secondary"))
+    choices.append(("cancel", t_ui("Flug abbrechen", "Cancel flight"), "danger"))
+
+    def on_choice(key: str) -> None:
+        STATE._mismatch_choice = str(key or "")
+
+    try:
+        from client_notice import ask_choice
+
+        ask_choice(
+            t_ui("FlyConomy – Flug fortsetzen?", "FlyConomy – Continue the flight?"),
+            msg,
+            choices,
+            on_choice,
+            code="FC-POSITION",
+        )
+    except Exception:
+        notify_windows(
+            t_ui("FlyConomy – Flug fortsetzen?", "FlyConomy – Continue the flight?"),
+            msg,
+            code="FC-POSITION",
+            kind="info",
+        )
+
+
+def apply_mismatch_choice(choice: str, raw: dict) -> bool:
+    """Returns True while the recording stays paused."""
+    choice = str(choice or "").strip().lower()
+    if choice == "reposition":
+        ref = STATE._mismatch_ref
+        ok = bool(ref) and STATE.sim.reposition(ref)
+        if ok:
+            STATE.log(
+                t_ui(
+                    "Flugzeug wird an die letzte Position gesetzt – die Aufzeichnung läuft weiter, "
+                    "sobald es dort ist.",
+                    "Moving the aircraft to the last position – recording resumes once it is there.",
+                )
+            )
+        else:
+            STATE.log(
+                t_ui(
+                    "Zurücksetzen hat nicht geklappt. Bitte erneut wählen oder hier weiterfliegen.",
+                    "Moving back failed. Please choose again or fly on from here.",
+                )
+            )
+            STATE._mismatch_prompted = False
+        return True
+    if choice == "continue":
+        report_position_suspect("gap_continue_here", raw, {"choice": "continue"})
+        if _monitoring_active():
+            _resolve_mismatch(
+                raw,
+                t_ui(
+                    "Weiterflug ab hier – der Sprung wurde an den Server gemeldet, er prüft den Flug.",
+                    "Flying on from here – the jump was reported, the server checks the flight.",
+                ),
+            )
+        return False
+    if choice == "cancel":
+        try:
+            action_cancel()
+        except Exception as e:
+            STATE.log(f"Abbruch: {e}")
+        return False
+    return True
+
+
+def position_mismatch_tick(raw: dict) -> bool:
+    """While the position does not fit. Returns True when the recording stays paused."""
+    if not STATE._position_mismatch:
+        return False
+    if STATE._mismatch_choice:
+        choice = STATE._mismatch_choice
+        STATE._mismatch_choice = ""
+        if not apply_mismatch_choice(choice, raw):
+            return False
+    try:
+        lat = float(raw["latitude"])
+        lon = float(raw["longitude"])
+    except (KeyError, TypeError, ValueError):
+        return True
+    if STATE._mismatch_kind == "gap":
+        ref = STATE._mismatch_ref or {}
+        try:
+            dist = nm_between(float(ref["latitude"]), float(ref["longitude"]), lat, lon)
+        except (KeyError, TypeError, ValueError):
+            dist = float("inf")
+        # Back at the last point (reposition) – or, after a stray sample, within the
+        # distance the gap itself allowed (review S8): go on without an answer.
+        if dist <= max(MISMATCH_RETURN_NM, _finite(STATE._mismatch_allowed_nm)):
+            _resolve_mismatch(
+                raw,
+                t_ui(
+                    "Flugzeug ist wieder an der letzten Position – Aufzeichnung läuft weiter.",
+                    "Aircraft is back at the last position – recording continues.",
+                ),
+            )
+            return False
+        if feature_enabled("suspect_report"):
+            ping_paused_tracking(raw)
+        else:
+            ping_mismatch_ref()
+        return True
+    prev = STATE._last_pos or {}
+    tnow = now_ms()
+    try:
+        dt = max(0.5, (tnow - int(prev.get("t") or tnow)) / 1000.0)
+        move = nm_between(float(prev["latitude"]), float(prev["longitude"]), lat, lon)
+    except (KeyError, TypeError, ValueError):
+        dt, move = 1.0, 0.0
+    allowed = allowed_move_nm(
+        dt,
+        raw.get("simulation_rate"),
+        prev.get("simulation_rate"),
+        gs_kt=_finite(raw.get("ground_speed"), 0.0),
+    )
+    STATE._mismatch_consistent = STATE._mismatch_consistent + 1 if move <= allowed else 0
+    STATE._last_pos = {
+        "latitude": lat,
+        "longitude": lon,
+        "simulation_rate": _finite(raw.get("simulation_rate"), 1.0),
+        "t": tnow,
+    }
+    if STATE._mismatch_consistent >= JUMP_CONSISTENT_TICKS:
+        _resolve_mismatch(
+            raw,
+            t_ui(
+                "Positionssprung an den Server gemeldet – Aufzeichnung läuft weiter. "
+                "Der Server prüft den Flug.",
+                "Position jump reported – recording continues. The server checks the flight.",
+            ),
+        )
+        return False
+    ping_paused_tracking(raw)
+    return True
+
+
 def abort_active_flight(reason: str) -> None:
-    """Cancel economy flight + Windows popup (language = FlyConomy UI locale)."""
+    """Cancel economy flight + Windows popup (language = FlyConomy UI locale).
+
+    Since 2.11.13 only slew, simrate, fuel/weight edits and 12 h without any sim
+    data end a flight locally – never the position alone (Q32).
+    """
     if STATE._aborting or STATE._auto_ending:
         return
     if not STATE.monitoring and not STATE.active_flight_id:
@@ -2760,24 +4135,12 @@ def abort_active_flight(reason: str) -> None:
     STATE._aborting = True
     messages = {
         "simrate": (
-            "Flug abgebrochen: Simrate über 16× ist nicht erlaubt.",
-            "Flight cancelled: Simulation rate above 16× is not allowed.",
-        ),
-        "teleport": (
-            "Flug abgebrochen: Flugzeug wurde versetzt (Teleport).",
-            "Flight cancelled: Aircraft was relocated (teleport).",
+            "Flug abgebrochen: Simrate über der erlaubten Grenze.",
+            "Flight cancelled: Simulation rate above the allowed limit.",
         ),
         "slew": (
             "Flug abgebrochen: Versetzen-Modus ist während eines Fluges nicht erlaubt.",
             "Flight cancelled: Relocate/slew mode is not allowed during a flight.",
-        ),
-        "session": (
-            "Flug abgebrochen: Sitzung beendet (Hauptmenü / Neustart).",
-            "Flight cancelled: Session ended (main menu / restart).",
-        ),
-        "msfs_exit": (
-            "Flug abgebrochen: Flight Simulator wurde beendet.",
-            "Flight cancelled: Flight Simulator was closed.",
         ),
         "abandoned": (
             "Flug abgebrochen: Über 12 Stunden keine Sim-Daten mehr.",
@@ -2810,96 +4173,144 @@ def abort_active_flight(reason: str) -> None:
     notify_windows(title, msg, code=f"FC-{str(reason or 'ABORT').upper().replace('_', '-')}", kind="abort")
 
 
+# ---------------------------------------------------------------------------
+# Flight session on disk (D1/D3): written atomically, restored after a restart.
+# ---------------------------------------------------------------------------
+
+SESSION_FORMAT = 2
+_session_save_warned = False
+
+
+def _session_payload() -> dict:
+    with STATE.lock:
+        return {
+            "format": SESSION_FORMAT,
+            "flight_id": STATE.active_flight_id,
+            "session_key": STATE.session_key,
+            "track": list(STATE.local_track),
+            "track_seq": STATE.track_seq,
+            "from_icao": STATE.from_icao,
+            "to_icao": STATE.to_icao,
+            "started_at": STATE.flight_started_at,
+            "registration": STATE.registration,
+            "aircraft_label": STATE.aircraft_label,
+            "load": STATE.load_info,
+            "has_gps": STATE.has_gps,
+            "has_autopilot": STATE.has_autopilot,
+            "was_airborne": STATE._was_airborne,
+            "max_nm_from_origin": STATE._max_nm_from_origin,
+            "paused_total_sec": STATE._paused_total_sec,
+            "max_sim_rate": STATE.max_sim_rate,
+            "fuel_policy": STATE.fuel_policy,
+            "client_features": STATE._flight_features,
+            "max_gs_kt": STATE._max_gs_seen,
+            "flight_title": STATE._flight_title,
+            "saved_at": time.time(),
+            "saved_at_server_ms": now_ms(),
+            "client_version": CLIENT_VERSION,
+        }
+
+
 def save_flight_session() -> None:
+    global _session_save_warned
     if not STATE.session_key or not STATE.active_flight_id:
         return
     try:
-        with STATE.lock:
-            payload = {
-                "flight_id": STATE.active_flight_id,
-                "session_key": STATE.session_key,
-                "track": list(STATE.local_track),
-                "track_seq": STATE.track_seq,
-                "from_icao": STATE.from_icao,
-                "to_icao": STATE.to_icao,
-                "started_at": STATE.flight_started_at,
-                "registration": STATE.registration,
-                "aircraft_label": STATE.aircraft_label,
-                "load": STATE.load_info,
-                "has_gps": STATE.has_gps,
-                "has_autopilot": STATE.has_autopilot,
-                "was_airborne": STATE._was_airborne,
-                "max_nm_from_origin": STATE._max_nm_from_origin,
-                "paused_total_sec": STATE._paused_total_sec,
-            }
-        with open(FLIGHT_SESSION_PATH, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-    except Exception:
-        pass
+        atomic_write_json(FLIGHT_SESSION_PATH, _session_payload())
+        _session_save_warned = False
+    except Exception as e:
+        if not _session_save_warned:
+            _session_save_warned = True
+            STATE.log(f"WARNUNG: Flug-Sitzung konnte nicht gespeichert werden: {e}")
 
 
-def load_flight_session() -> bool:
-    try:
-        if not os.path.exists(FLIGHT_SESSION_PATH):
-            return False
-        with open(FLIGHT_SESSION_PATH, encoding="utf-8") as f:
-            data = json.load(f)
-        if not data.get("session_key") or not data.get("flight_id"):
-            return False
-        STATE.active_flight_id = data.get("flight_id")
+def read_flight_session_file() -> Optional[dict]:
+    data = read_json_file(FLIGHT_SESSION_PATH)
+    if not isinstance(data, dict) or not data.get("session_key") or not data.get("flight_id"):
+        return None
+    return data
+
+
+def session_file_present() -> bool:
+    return read_flight_session_file() is not None
+
+
+def apply_flight_session(data: dict, *, restored: bool = True) -> None:
+    """Put a stored session into STATE (only after its flight id was checked)."""
+    STATE.active_flight_id = data.get("flight_id")
+    with STATE.lock:
         STATE.session_key = data.get("session_key")
         STATE.local_track = list(data.get("track") or [])
         STATE.track_seq = int(data.get("track_seq") or len(STATE.local_track))
-        STATE.from_icao = data.get("from_icao")
-        STATE.to_icao = data.get("to_icao")
-        STATE.flight_started_at = data.get("started_at")
-        STATE.registration = data.get("registration")
-        STATE.economy_registration = STATE.registration
-        STATE.aircraft_label = data.get("aircraft_label") or ""
-        STATE.load_info = data.get("load") or {}
-        STATE.has_gps = True if "has_gps" not in data else bool(data.get("has_gps"))
-        STATE.has_autopilot = True if "has_autopilot" not in data else bool(data.get("has_autopilot"))
-        STATE._was_airborne = bool(data.get("was_airborne"))
-        STATE._max_nm_from_origin = float(data.get("max_nm_from_origin") or 0)
-        STATE._paused_total_sec = float(data.get("paused_total_sec") or 0)
-        origin = STATE.local_track[0] if STATE.local_track else None
+    STATE.from_icao = data.get("from_icao")
+    STATE.to_icao = data.get("to_icao")
+    STATE.flight_started_at = data.get("started_at")
+    STATE.registration = data.get("registration")
+    STATE.economy_registration = STATE.registration
+    STATE.aircraft_label = data.get("aircraft_label") or ""
+    STATE.load_info = data.get("load") or {}
+    STATE.has_gps = True if "has_gps" not in data else bool(data.get("has_gps"))
+    STATE.has_autopilot = True if "has_autopilot" not in data else bool(data.get("has_autopilot"))
+    STATE._was_airborne = bool(data.get("was_airborne"))
+    STATE._max_nm_from_origin = float(data.get("max_nm_from_origin") or 0)
+    STATE._paused_total_sec = float(data.get("paused_total_sec") or 0)
+    msr = _finite(data.get("max_sim_rate"), 0.0)
+    STATE.max_sim_rate = msr if msr > 0 else MAX_SIM_RATE
+    STATE.fuel_policy = data.get("fuel_policy") if isinstance(data.get("fuel_policy"), dict) else {}
+    STATE._flight_features = (
+        data.get("client_features") if isinstance(data.get("client_features"), dict) else {}
+    )
+    STATE._max_gs_seen = _finite(data.get("max_gs_kt"), 0.0)
+    STATE._flight_title = str(data.get("flight_title") or "")
+    origin = STATE.local_track[0] if STATE.local_track else None
+    for p in STATE.local_track:
+        note_max_gs(p.get("ground_speed"))
         if origin:
-            for p in STATE.local_track:
-                try:
-                    nm = nm_between(
-                        float(origin["latitude"]),
-                        float(origin["longitude"]),
-                        float(p["latitude"]),
-                        float(p["longitude"]),
-                    )
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if nm > STATE._max_nm_from_origin:
-                    STATE._max_nm_from_origin = nm
-                if float(p.get("ground_speed") or 0) >= AIRBORNE_GS_KT:
-                    STATE._was_airborne = True
-        STATE._integrity_last = None
-        STATE._last_good_fuel = 0.0
-        STATE._last_good_weight = 0.0
-        STATE._fuel_zero_streak = 0
-        last_pt = STATE.local_track[-1] if STATE.local_track else None
-        if last_pt:
-            # Continuity reference for the restart case: the aircraft has to show up
-            # near the last recorded point again, otherwise nothing is recorded.
-            STATE._resume_ref = {
-                "latitude": float(last_pt.get("latitude") or 0),
-                "longitude": float(last_pt.get("longitude") or 0),
-                "fuel_total": _finite(last_pt.get("fuel_total")),
-                "total_weight_lb": _finite(last_pt.get("total_weight_lb")),
-                "simulation_rate": _finite(last_pt.get("simulation_rate"), 1.0),
-                "t": int(last_pt.get("t") or 0),
-            }
-            last_t = float(last_pt.get("t") or 0) / 1000.0
-            STATE._sim_gap_since = last_t if last_t > 0 else time.time()
-        STATE.monitoring = True
-        return True
-    except Exception:
+            try:
+                nm = nm_between(
+                    float(origin["latitude"]),
+                    float(origin["longitude"]),
+                    float(p["latitude"]),
+                    float(p["longitude"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if nm > STATE._max_nm_from_origin:
+                STATE._max_nm_from_origin = nm
+        if float(p.get("ground_speed") or 0) >= AIRBORNE_GS_KT:
+            STATE._was_airborne = True
+    STATE._integrity_last = None
+    STATE._last_good_fuel = 0.0
+    STATE._last_good_weight = 0.0
+    STATE._fuel_zero_streak = 0
+    STATE._gap_confirm = 0
+    STATE._gap_fuel_confirm = 0
+    _clear_mismatch()
+    last_pt = STATE.local_track[-1] if STATE.local_track else None
+    if last_pt:
+        # Continuity reference for the restart case: the aircraft has to show up
+        # near the last recorded point again, otherwise the recording waits.
+        try:
+            STATE._resume_ref = _pos_ref(last_pt, int(last_pt.get("t") or now_ms()))
+        except (KeyError, TypeError, ValueError):
+            STATE._resume_ref = None
+        note_last_signed_t(last_pt.get("t"))
+        last_t = float(last_pt.get("t") or 0) / 1000.0
+        # track times are server clock – back to the PC clock for the gap length
+        last_local = last_t - SERVER_CLOCK.offset_ms / 1000.0 if last_t > 0 else 0.0
+        STATE._sim_gap_since = last_local if last_local > 0 else time.time()
+        STATE._gap_wall_since = time.time()
+        STATE._gap_reason = "restore" if restored else STATE._gap_reason
+        STATE._restored_session = restored
+    STATE.monitoring = True
+
+
+def load_flight_session() -> bool:
+    data = read_flight_session_file()
+    if not data:
         return False
+    apply_flight_session(data, restored=True)
+    return True
 
 
 def nm_between(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
@@ -2917,31 +4328,36 @@ def nm_between(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 
 
 def _parse_started_at(val: Any) -> Optional[float]:
+    """Server timestamp → seconds on the PC clock (the server clock offset removed)."""
     if val is None:
         return None
     if isinstance(val, (int, float)):
         ts = float(val)
-        return ts / 1000.0 if ts > 1e12 else ts
-    try:
-        s = str(val).replace("Z", "+00:00")
-        return datetime.fromisoformat(s).timestamp()
-    except Exception:
-        return None
+        ts = ts / 1000.0 if ts > 1e12 else ts
+    else:
+        try:
+            s = str(val).replace("Z", "+00:00")
+            ts = datetime.fromisoformat(s).timestamp()
+        except Exception:
+            return None
+    return ts - SERVER_CLOCK.offset_ms / 1000.0
 
 
-def apply_flight_meta(result: dict, started_at: Optional[float] = None) -> None:
+def apply_flight_meta(result: dict, started_at: Optional[float] = None, *, keep_load: bool = False) -> None:
     ac = result.get("aircraft") or {}
     load = result.get("load") or {}
     flight = result.get("flight") or {}
     make = str(ac.get("make") or flight.get("make") or "").strip()
     model = str(ac.get("model") or flight.get("model") or "").strip()
     reg = str(ac.get("registration") or flight.get("registration") or "").strip().upper()
-    STATE.registration = reg or None
-    STATE.economy_registration = STATE.registration
-    STATE.aircraft_label = " ".join(x for x in (reg, make, model) if x)
-    STATE.from_icao = str(
-        result.get("from_icao") or flight.get("from_icao") or ""
-    ).upper() or None
+    keep = bool(keep_load and STATE.load_info)
+    if reg or not keep:
+        STATE.registration = reg or None
+        STATE.economy_registration = STATE.registration
+        STATE.aircraft_label = " ".join(x for x in (reg, make, model) if x)
+    from_icao = str(result.get("from_icao") or flight.get("from_icao") or "").upper() or None
+    if from_icao or not keep:
+        STATE.from_icao = from_icao
     to_raw = (
         result.get("to_icao")
         or flight.get("to_icao")
@@ -2952,36 +4368,47 @@ def apply_flight_meta(result: dict, started_at: Optional[float] = None) -> None:
             to_raw = job.get("to_icao")
             if to_raw:
                 break
-    STATE.to_icao = str(to_raw or "").strip().upper() or None
-    STATE.flight_started_at = started_at or time.time()
-    STATE.has_gps = bool(ac.get("has_gps") if "has_gps" in ac else flight.get("has_gps", True))
-    STATE.has_autopilot = bool(
-        ac.get("has_autopilot") if "has_autopilot" in ac else flight.get("has_autopilot", True)
-    )
-    STATE.load_info = {
-        "pax": int(load.get("seats_used") or 0),
-        "seats": int(ac.get("seats") or flight.get("seats") or load.get("seats_total") or 0),
-        "seats_used": int(load.get("seats_used") or 0),
-        "seats_total": int(load.get("seats_total") or ac.get("seats") or 0),
-        "passengers": int(load.get("passengers") or 0),
-        "cargo_kg": float(load.get("cargo_kg") or 0),
-        "payload_kg": float(load.get("payload_kg") or 0),
-        "payload_lb": float(load.get("payload_lb") or 0)
-        or (float(load.get("payload_kg") or 0) * 2.20462262),
-        "crew_kg": float(load.get("crew_kg") or 77),
-        "fuel_gal": float(load.get("fuel_gallons") or 0),
-        "fuel_pct": float(load.get("fuel_percent") or 0),
-        "fuel_capacity": float(load.get("fuel_capacity") or ac.get("fuel_capacity") or 0),
-        "is_heavy": bool(load.get("is_heavy") or ac.get("is_heavy")),
-        "custom_fuel": bool(
-            load.get("custom_fuel")
-            or (result.get("sim_load") or {}).get("custom_fuel")
-        ),
-        "sim_title": str(load.get("sim_title") or ""),
-        "weight_kg": float(load.get("total_weight_kg") or 0),
-        "jobs": len(load.get("assignments") or []),
-        "assignments": list(load.get("assignments") or []),
-    }
+    to_icao = str(to_raw or "").strip().upper() or None
+    if to_icao or not keep:
+        STATE.to_icao = to_icao
+    STATE.flight_started_at = started_at or STATE.flight_started_at or time.time()
+    msr = _finite(result.get("max_sim_rate"), 0.0)
+    if msr > 0:
+        STATE.max_sim_rate = msr
+    if isinstance(result.get("fuel_policy"), dict):
+        STATE.fuel_policy = dict(result["fuel_policy"])
+    if isinstance(result.get("client_features"), dict):
+        STATE._flight_features = dict(result["client_features"])
+    if not keep:
+        STATE.has_gps = bool(ac.get("has_gps") if "has_gps" in ac else flight.get("has_gps", True))
+        STATE.has_autopilot = bool(
+            ac.get("has_autopilot") if "has_autopilot" in ac else flight.get("has_autopilot", True)
+        )
+        STATE.load_info = {
+            "pax": int(load.get("seats_used") or 0),
+            "seats": int(ac.get("seats") or flight.get("seats") or load.get("seats_total") or 0),
+            "seats_used": int(load.get("seats_used") or 0),
+            "seats_total": int(load.get("seats_total") or ac.get("seats") or 0),
+            "passengers": int(load.get("passengers") or 0),
+            "cargo_kg": float(load.get("cargo_kg") or 0),
+            "payload_kg": float(load.get("payload_kg") or 0),
+            "payload_lb": float(load.get("payload_lb") or 0)
+            or (float(load.get("payload_kg") or 0) * 2.20462262),
+            "crew_kg": float(load.get("crew_kg") or 77),
+            "fuel_gal": float(load.get("fuel_gallons") or 0),
+            "fuel_pct": float(load.get("fuel_percent") or 0),
+            "fuel_capacity": float(load.get("fuel_capacity") or ac.get("fuel_capacity") or 0),
+            "is_heavy": bool(load.get("is_heavy") or ac.get("is_heavy")),
+            "custom_fuel": bool(
+                load.get("custom_fuel")
+                or (result.get("sim_load") or {}).get("custom_fuel")
+            ),
+            "sim_title": str(load.get("sim_title") or ""),
+            "weight_kg": float(load.get("total_weight_kg") or 0),
+            "jobs": len(load.get("assignments") or []),
+            "assignments": list(load.get("assignments") or []),
+            "cruise_speed": _finite(ac.get("cruise_speed") or load.get("cruise_speed"), 0.0),
+        }
     try:
         hrs = STATE.api.get_hours_remaining()
         if hrs is not None:
@@ -2991,65 +4418,213 @@ def apply_flight_meta(result: dict, started_at: Optional[float] = None) -> None:
     save_flight_session()
 
 
-def queue_pending_end(payload: dict, reason: str) -> None:
-    """Stores an unsent flight end on disk so it survives a client restart."""
+# ---------------------------------------------------------------------------
+# Flight end on disk (D6): written BEFORE sending, resent until the server
+# confirms. Safe because the server answers a repeated /end (C1) – an old server
+# answers "Flug bereits abgerechnet" / "Kein aktiver Flug", handled below.
+# ---------------------------------------------------------------------------
+
+PENDING_END_FORMAT = 2
+
+
+def persist_pending_end(payload: dict, flight_id: Any, reason: str = "sending") -> dict:
     payload = dict(payload or {})
     if isinstance(payload.get("track"), list):
         payload["track"] = compact_track(payload["track"], MAX_TRACK_POINTS_SEND)
-    record = {"queued_at": time.time(), "reason": reason, "payload": payload}
+    record = {
+        "format": PENDING_END_FORMAT,
+        "queued_at": time.time(),
+        "reason": reason,
+        "flight_id": flight_id,
+        "payload": payload,
+        "attempts": 0,
+        "next_try_at": 0.0,
+        "last_error": "",
+    }
     try:
-        with open(PENDING_END_PATH, "w", encoding="utf-8") as f:
-            json.dump(record, f)
-        STATE.pending_end = record
-        STATE.log(f"Flugende zwischengespeichert – wird automatisch nachgesendet ({reason})")
+        atomic_write_json(PENDING_END_PATH, record)
     except Exception as e:
-        STATE.log(f"WARNUNG: Flugende konnte nicht zwischengespeichert werden: {e}")
+        STATE.log(f"WARNUNG: Flugende konnte nicht gespeichert werden: {e}")
+    STATE.pending_end = record
+    return record
+
+
+def note_session_ended(session_key: Any, flight_id: Any = None, result: Optional[dict] = None) -> None:
+    """The server logged/closed this session's flight, or the pilot cancelled it.
+
+    Remembered for this process (review S8) so that a restore which read the
+    server's answer a moment earlier, a pending end written back by a parallel send,
+    or the log window never revive it. A session file of that flight is removed."""
+    key = str(session_key or "")
+    if not key:
+        return
+    STATE._ended_sessions[key] = {
+        "at": time.time(),
+        "flight_id": flight_id,
+        "result": dict(result) if isinstance(result, dict) else None,
+    }
+    if len(STATE._ended_sessions) > 20:
+        oldest = sorted(STATE._ended_sessions.items(), key=lambda kv: kv[1].get("at") or 0)
+        for k, _v in oldest[: len(STATE._ended_sessions) - 20]:
+            STATE._ended_sessions.pop(k, None)
+    with STATE.lock:
+        in_memory = STATE.session_key == key
+    if not in_memory:
+        data = read_flight_session_file()
+        if data and str(data.get("session_key")) == key:
+            remove_file_and_bak(FLIGHT_SESSION_PATH)
+
+
+def session_ended(session_key: Any) -> bool:
+    return bool(session_key) and str(session_key) in STATE._ended_sessions
+
+
+def flight_ended_locally(flight_id: Any) -> bool:
+    if flight_id is None:
+        return False
+    return any(str(v.get("flight_id")) == str(flight_id) for v in STATE._ended_sessions.values())
+
+
+def ended_result_for(session_key: Any) -> Optional[dict]:
+    """The server's /end answer when this session was logged in this process."""
+    hit = STATE._ended_sessions.get(str(session_key or ""))
+    res = (hit or {}).get("result")
+    return dict(res) if isinstance(res, dict) else None
+
+
+def current_end_session_key() -> str:
+    """Session key of the flight an end would be sent for: memory, file, pending end."""
+    with STATE.lock:
+        key = STATE.session_key
+    if key:
+        return str(key)
+    data = read_flight_session_file()
+    if data and data.get("session_key"):
+        return str(data["session_key"])
+    rec = STATE.pending_end or load_pending_end()
+    return str(((rec or {}).get("payload") or {}).get("session_key") or "")
+
+
+def update_pending_end(record: dict, **changes: Any) -> None:
+    record.update(changes)
+    key = (record.get("payload") or {}).get("session_key")
+    if session_ended(key):
+        return  # cancelled or logged meanwhile – never write it back (review S8)
+    if STATE.pending_end is None and not file_or_bak_exists(PENDING_END_PATH):
+        return  # cleared by another thread while this send was running
+    try:
+        atomic_write_json(PENDING_END_PATH, record)
+    except Exception:
+        pass
+    STATE.pending_end = record
+
+
+def queue_pending_end(payload: dict, reason: str) -> None:
+    """Kept for older call sites: store an unsent end for the retry loop."""
+    persist_pending_end(payload, STATE.active_flight_id, reason)
+    STATE.log(f"Flugende zwischengespeichert – wird automatisch nachgesendet ({reason})")
 
 
 def load_pending_end() -> Optional[dict]:
-    if not os.path.exists(PENDING_END_PATH):
-        return None
-    try:
-        with open(PENDING_END_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+    data = read_json_file(PENDING_END_PATH)
+    if isinstance(data, dict) and isinstance(data.get("payload"), dict):
+        return data
+    return None
 
 
 def clear_pending_end() -> None:
     STATE.pending_end = None
-    try:
-        if os.path.exists(PENDING_END_PATH):
-            os.remove(PENDING_END_PATH)
-    except Exception:
-        pass
+    remove_file_and_bak(PENDING_END_PATH)
 
 
-def flush_pending_end() -> Optional[dict]:
-    """Retries a queued flight end once. Returns the server result on success."""
+def pending_end_for(flight_id: Any, session_key: Optional[str]) -> Optional[dict]:
     record = STATE.pending_end or load_pending_end()
-    if not record or not STATE.api.token:
+    if not record:
+        return None
+    payload = record.get("payload") or {}
+    if session_key and payload.get("session_key") != session_key:
+        return None
+    fid = record.get("flight_id")
+    if fid is not None and flight_id is not None and str(fid) != str(flight_id):
+        return None
+    return record
+
+
+def _pending_is_current_flight(record: dict) -> bool:
+    payload = record.get("payload") or {}
+    if not STATE.session_key or payload.get("session_key") != STATE.session_key:
+        return False
+    fid = record.get("flight_id")
+    return fid is None or STATE.active_flight_id is None or str(fid) == str(STATE.active_flight_id)
+
+
+def _send_pending_end(record: dict, *, notify: bool = True) -> Optional[dict]:
+    payload = dict(record.get("payload") or {})
+    key = payload.get("session_key")
+    now = time.time()
+    if session_ended(key):
+        clear_pending_end()  # cancelled or logged in this process already
         return None
     try:
-        pl = dict(record.get("payload") or {})
-        if isinstance(pl.get("track"), list):
-            pl["track"] = compact_track(pl["track"], MAX_TRACK_POINTS_SEND)
-            record = {**record, "payload": pl}
-        result = STATE.api.submit_end(pl)
+        result = STATE.api.submit_end(payload)
     except RetryableError as e:
-        STATE.pending_end = record
+        update_pending_end(
+            record,
+            attempts=int(record.get("attempts") or 0) + 1,
+            last_error=str(e),
+            next_try_at=now + max(5, int(getattr(e, "retry_after", 15) or 15)),
+        )
         STATE.last_error = str(e)
+        return None
+    except SessionInvalidError as e:
+        STATE.log(f"Nachgesendetes Flugende passt nicht mehr zur Sitzung – verworfen: {e}")
+        clear_pending_end()
         return None
     except KeepFlyingError as e:
-        # Airborne / busy: keep the queued end and retry. Session mismatch cannot succeed.
-        msg = str(e).lower()
-        if "session" in msg:
-            STATE.log(f"Nachgesendetes Flugende: {e}")
-            clear_pending_end()
+        if getattr(e, "code", "") == "TOKEN":
+            update_pending_end(record, last_error=str(e), next_try_at=now + 60)
+            STATE.last_error = str(e)
             return None
-        STATE.pending_end = record
-        STATE.last_error = str(e)
-        STATE.log(f"Nachgesendetes Flugende wartet: {e}")
+        # Stored at the parking position; NOT_ON_GROUND etc. cannot get better.
+        STATE.log(f"Nachgesendetes Flugende abgelehnt, Flug läuft weiter: {e}")
+        clear_pending_end()
+        return None
+    except AirportRejectedError as e:
+        STATE.log(f"Nachgesendetes Flugende: {e} – Flug läuft weiter.")
+        clear_pending_end()
+        return None
+    except FlightClosedError as e:
+        clear_pending_end()
+        # Review S8: "current" only now – a restore may have applied this very
+        # session while the request was on its way.
+        current = _pending_is_current_flight(record)
+        note_session_ended(key, record.get("flight_id"))
+        if current:
+            server_ended_flight(str(e))
+        else:
+            STATE.log(f"Nachgesendetes Flugende: Flug vom Server beendet ({e}).")
+        return None
+    except NoActiveFlightError as e:
+        clear_pending_end()
+        gone = True
+        try:
+            gone = not STATE.api.get_active()
+        except Exception:
+            gone = False
+        msg = t_ui(
+            "Der Flug ist auf dem Server nicht mehr aktiv – vermutlich wurde er schon geloggt. "
+            "Bitte auf der Website unter „Flüge“ nachsehen.",
+            "The flight is no longer active on the server – it was probably logged already. "
+            "Please check “Flights” on the website.",
+        )
+        STATE.log(f"{msg} ({e})")
+        current = _pending_is_current_flight(record)
+        if gone:
+            note_session_ended(key, record.get("flight_id"))
+        if current and gone:
+            _clear_flight_runtime()
+            if notify:
+                notify_windows(t_ui("FlyConomy – Flugende", "FlyConomy – Flight end"), msg, code="FC-END-UNKNOWN", kind="info")
         return None
     except Exception as e:
         # The server rejected it for good – keeping it queued would loop forever
@@ -3058,26 +4633,77 @@ def flush_pending_end() -> Optional[dict]:
         return None
 
     clear_pending_end()
+    # Review S8: decide AFTER the answer whether this is the flight in memory – the
+    # restore thread may have applied the session while the POST was running.
+    note_session_ended(key, record.get("flight_id") or result.get("flight_id"), result)
+    if _pending_is_current_flight(record):
+        _clear_flight_runtime()
+        STATE.set_ui_status("Flug beendet", "Flight ended")
+    remember_end_result(result)
     STATE.log(
-        f"Nachgesendetes Flugende akzeptiert – Status "
-        f"{result.get('validation', {}).get('status')} · Pay ${result.get('total_payment', 0)}"
+        f"Flugende akzeptiert – Status "
+        f"{(result.get('validation') or {}).get('status') or ('bereits geloggt' if result.get('already_logged') else '?')} "
+        f"· Pay ${result.get('total_payment', 0)}"
     )
-    notify_flight_logged(result)
-    schedule_cockpit_ack("log")
+    if notify:
+        notify_flight_logged(result)
+        schedule_cockpit_ack("log")
     return result
 
 
-def queue_pending_start(reason: str) -> None:
-    record = {"queued_at": time.time(), "reason": reason}
+def flush_pending_end() -> Optional[dict]:
+    """Retries a stored flight end (retry loop). Returns the server result on success."""
+    record = STATE.pending_end or load_pending_end()
+    if not record or not ensure_api_token():
+        return None
+    if time.time() < float(record.get("next_try_at") or 0):
+        return None
+    if _log_window_sending() and _pending_is_current_flight(record):
+        return None  # the log window retries this very end itself (review S8)
+    if not _END_LOCK.acquire(blocking=False):
+        return None  # the log window is sending this very end right now
     try:
-        with open(PENDING_START_PATH, "w", encoding="utf-8") as f:
-            json.dump(record, f)
-        STATE.pending_start = record
-        msg = t_ui(
-            "Server kurz weg — Start wird automatisch nachgeholt. Sim nicht verlassen.",
-            "Server briefly down — start will retry automatically. Stay in the sim.",
-        )
-        STATE.set_ui_status(msg)
+        record = load_pending_end() or STATE.pending_end
+        if not record:
+            return None
+        return _send_pending_end(record, notify=True)
+    finally:
+        _END_LOCK.release()
+
+
+def _log_window_sending() -> bool:
+    """True while the log window's worker runs (also between its retries)."""
+    mod = sys.modules.get("flight_log_ui")
+    return bool(getattr(mod, "_busy", False)) if mod is not None else False
+
+
+# ---------------------------------------------------------------------------
+# Start queue (D7): one record, its first queued_at kept, one notice only.
+# ---------------------------------------------------------------------------
+
+
+def write_pending_start(record: dict) -> None:
+    try:
+        atomic_write_json(PENDING_START_PATH, record)
+    except Exception as e:
+        STATE.log(f"WARNUNG: Start konnte nicht zwischengespeichert werden: {e}")
+    STATE.pending_start = record
+
+
+def queue_pending_start(reason: str, record: Optional[dict] = None) -> dict:
+    record = dict(record or {})
+    first = not record.get("notified")
+    record.setdefault("queued_at", time.time())
+    record["reason"] = reason
+    record["state"] = "queued"
+    record["notified"] = True
+    write_pending_start(record)
+    msg = t_ui(
+        "Server kurz weg — Start wird automatisch nachgeholt. NICHT losfliegen, im Sim bleiben.",
+        "Server briefly down — start will retry automatically. Do NOT take off, stay in the sim.",
+    )
+    STATE.set_ui_status(msg)
+    if first:
         STATE.log(msg)
         notify_windows(
             t_ui("FlyConomy – Start wartet", "FlyConomy – Start queued"),
@@ -3085,35 +4711,50 @@ def queue_pending_start(reason: str) -> None:
             code="FC-START-QUEUED",
             kind="info",
         )
-    except Exception as e:
-        STATE.log(f"WARNUNG: Start konnte nicht zwischengespeichert werden: {e}")
+    return record
 
 
 def load_pending_start() -> Optional[dict]:
-    if not os.path.exists(PENDING_START_PATH):
-        return None
-    try:
-        with open(PENDING_START_PATH, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except Exception:
-        return None
+    data = read_json_file(PENDING_START_PATH)
+    return data if isinstance(data, dict) else None
 
 
 def clear_pending_start() -> None:
     STATE.pending_start = None
+    remove_file_and_bak(PENDING_START_PATH)
+
+
+def pending_start_moved(record: dict, sample: dict) -> Optional[str]:
+    """Why a queued start must not be sent any more, or None (D7)."""
+    pos = record.get("pos") or {}
+    if not bool(sample.get("on_ground")):
+        return t_ui("das Flugzeug ist in der Luft", "the aircraft is airborne")
+    if _finite(sample.get("ground_speed")) > PENDING_START_MAX_GS_KT:
+        return t_ui("das Flugzeug rollt", "the aircraft is moving")
     try:
-        if os.path.exists(PENDING_START_PATH):
-            os.remove(PENDING_START_PATH)
-    except Exception:
-        pass
+        moved = nm_between(
+            float(pos["latitude"]),
+            float(pos["longitude"]),
+            float(sample["latitude"]),
+            float(sample["longitude"]),
+        )
+    except (KeyError, TypeError, ValueError):
+        return None
+    if moved > PENDING_START_MAX_MOVE_NM:
+        return t_ui(
+            f"das Flugzeug steht {moved:.1f} nm weiter weg",
+            f"the aircraft moved {moved:.1f} nm",
+        )
+    return None
 
 
 def flush_pending_start() -> Optional[dict]:
     record = STATE.pending_start or load_pending_start()
-    if not record or not STATE.api.token:
+    if not record or not ensure_api_token():
         return None
+    now = time.time()
     queued_at = float(record.get("queued_at") or 0)
-    if queued_at and time.time() - queued_at > PENDING_START_MAX_SEC:
+    if not queued_at or now - queued_at > PENDING_START_MAX_SEC:
         clear_pending_start()
         msg = t_ui(
             "Start-Warteschlange abgelaufen – bitte erneut starten.",
@@ -3121,35 +4762,64 @@ def flush_pending_start() -> Optional[dict]:
         )
         STATE.last_error = msg
         STATE.log(msg)
+        notify_windows(t_ui("FlyConomy – Start", "FlyConomy – Start"), msg, code="FC-START-EXPIRED", kind="info")
+        return None
+    if now < float(record.get("next_try_at") or 0):
+        return None
+    if STATE.monitoring and STATE.session_key:
+        clear_pending_start()  # a flight is already being recorded
+        return None
+    if not STATE.sim.connected and not _msfs_process_running():
+        # Review S8: without MSFS no /start can be prepared – no HTTP every 5 s.
+        _delay_pending_start(record, 15)
         return None
     try:
-        result = action_start()
-        if result.get("queued"):
-            return None
-        clear_pending_start()
-        return result
+        return action_start(from_queue=record, wait=False)
     except RetryableError as e:
-        STATE.pending_start = record
-        STATE.last_error = str(e)
+        _delay_pending_start(record, max(15, int(getattr(e, "retry_after", 15) or 15)))
         return None
     except Exception as e:
-        STATE.log(f"Nachgeholter Start abgelehnt: {e}")
-        clear_pending_start()
+        # action_start cleared the record and told the pilot (_start_failed); keep
+        # the reason visible in any case.
         STATE.last_error = str(e)
         return None
+
+
+def _delay_pending_start(record: dict, sec: float) -> None:
+    """Next try of a waiting start not before now+sec (never earlier than planned)."""
+    current = STATE.pending_start if isinstance(STATE.pending_start, dict) else load_pending_start()
+    if not isinstance(current, dict):
+        return  # cleared meanwhile
+    if current.get("client_session_key") != record.get("client_session_key"):
+        return
+    due = time.time() + float(sec)
+    if float(current.get("next_try_at") or 0) >= due:
+        return
+    current["next_try_at"] = due
+    write_pending_start(current)
+
+
+def reset_queue_timers() -> None:
+    """A freshly started client tries stored start/end records right away (the
+    waiting time belonged to the previous process)."""
+    STATE.pending_end = STATE.pending_end or load_pending_end()
+    STATE.pending_start = STATE.pending_start or load_pending_start()
+    for rec in (STATE.pending_end, STATE.pending_start):
+        if isinstance(rec, dict):
+            rec["next_try_at"] = 0.0
 
 
 def retry_loop() -> None:
     """Background worker that drains pending start/end queues."""
     while True:
         try:
-            if (STATE.pending_end or os.path.exists(PENDING_END_PATH)) and STATE.api.token:
+            if (STATE.pending_end or file_or_bak_exists(PENDING_END_PATH)) and STATE.api.token:
                 flush_pending_end()
-            if (STATE.pending_start or os.path.exists(PENDING_START_PATH)) and STATE.api.token:
+            if (STATE.pending_start or file_or_bak_exists(PENDING_START_PATH)) and STATE.api.token:
                 flush_pending_start()
         except Exception as e:
             STATE.last_error = str(e)
-        time.sleep(15)
+        time.sleep(5)
 
 
 def _finite(val: Any, default: float = 0.0) -> float:
@@ -3213,6 +4883,10 @@ def stabilize_load(sample: dict) -> dict:
     last_w = float(STATE._last_good_weight or 0)
     fuel = sample.get("fuel_total")
     weight = sample.get("total_weight_lb")
+    now_t = time.time()
+    refuel_ok = bool(getattr(STATE, "_gsx_refuel", False)) or now_t < float(
+        getattr(STATE, "_refuel_grace_until", 0) or 0
+    )
     try:
         fuel_f = float(fuel) if fuel is not None else None
     except (TypeError, ValueError):
@@ -3241,8 +4915,16 @@ def stabilize_load(sample: dict) -> dict:
         else:
             STATE._fuel_zero_streak = 0
             if fuel_f is not None and fuel_f >= FUEL_ZERO_SPIKE_GAL:
-                STATE._last_good_fuel = fuel_f
-                sample["fuel_total"] = fuel_f
+                parked_spike = (
+                    parked
+                    and fuel_f > last_f + FUEL_INCREASE_ABORT_GAL
+                    and not refuel_ok
+                )
+                if parked_spike:
+                    sample["fuel_total"] = last_f
+                else:
+                    STATE._last_good_fuel = fuel_f
+                    sample["fuel_total"] = fuel_f
     elif fuel_f is not None and fuel_f >= FUEL_ZERO_SPIKE_GAL:
         STATE._last_good_fuel = fuel_f
         sample["fuel_total"] = fuel_f
@@ -3260,9 +4942,29 @@ def stabilize_load(sample: dict) -> dict:
     return sample
 
 
+def _policy_markers(*keys: str) -> tuple:
+    """Marker lists the server sends in /start → fuel_policy (E7)."""
+    pol = STATE.fuel_policy if isinstance(STATE.fuel_policy, dict) else {}
+    out: list = []
+    for key in keys:
+        vals = pol.get(key)
+        if isinstance(vals, (list, tuple)):
+            out.extend(str(v).strip().lower() for v in vals if str(v).strip())
+    return tuple(out)
+
+
 def _blob_has_unreliable_fuel(blob: str) -> bool:
     b = (blob or "").lower()
-    return any(m in b for m in _UNRELIABLE_FUEL_MARKERS)
+    markers = _UNRELIABLE_FUEL_MARKERS + _policy_markers("unreliable_markers", "markers")
+    return any(m in b for m in markers)
+
+
+def fuel_policy_says_unreliable() -> bool:
+    pol = STATE.fuel_policy if isinstance(STATE.fuel_policy, dict) else {}
+    for key in ("fuel_unreliable", "unreliable", "skip_load_integrity", "custom_fuel"):
+        if pol.get(key) is True:
+            return True
+    return False
 
 
 def sim_fuel_unreliable() -> bool:
@@ -3276,10 +4978,17 @@ def sim_fuel_unreliable() -> bool:
     load = STATE.load_info or {}
     if load.get("is_heavy") or load.get("custom_fuel"):
         return True
+    # Same marker list as the server (E7): the DC-3 used to be cancelled here
+    # although the server would have accepted the flight.
+    if fuel_policy_says_unreliable():
+        return True
     cap = float(load.get("fuel_capacity") or 0)
     if cap >= 1500.0:
         return True
     extra = f"{STATE.aircraft_label or ''} {load.get('sim_title') or ''}"
+    custom_markers = _policy_markers("custom_fuel_markers")
+    if custom_markers and any(m in extra.lower() for m in custom_markers):
+        return True
     try:
         extra = f"{extra} {STATE.sim.sim_title()}"
     except Exception:
@@ -3331,20 +5040,6 @@ def note_flight_progress(sample: dict) -> None:
         STATE._max_nm_from_origin = nm
 
 
-def _abort_from_tracking_error(err: str, *, unreliable: bool, gate_loading: bool) -> Optional[str]:
-    """Map a server tracking 400 to a local abort — never call fuel_tamper for teleport/Fenix."""
-    low = (err or "").lower()
-    if any(k in low for k in ("position", "versetzt", "teleport", "unmöglich", "unmoeglich")):
-        return "teleport"
-    if "groundspeed" in low or "simrate" in low:
-        return "simrate" if "simrate" in low else "teleport"
-    if "treibstoff" in low or "gewicht" in low or "manuell" in low:
-        if unreliable or gate_loading:
-            return None
-        return "weight_tamper" if "gewicht" in low else "fuel_tamper"
-    return None
-
-
 def fuel_weight_tamper_reason(
     prev: dict,
     sample: dict,
@@ -3388,25 +5083,46 @@ def fuel_weight_tamper_reason(
     return None
 
 
-def sign_point(session_key: str, seq: int, sample: dict) -> dict:
-    t = int(time.time() * 1000)
+_SIGN_LOCK = threading.Lock()
+_LAST_SIGNED_T = {"t": 0}
+
+
+def track_sign_payload(seq: int, t: int, sample: dict) -> str:
+    """Byte for byte backend/src/utils/flightSession.ts::signTrackPoint (toFixed)."""
     rate = float(sample.get("simulation_rate") or 1.0)
-    payload = "|".join(
+    return "|".join(
         [
-            str(seq),
-            str(t),
-            f"{float(sample['latitude']):.6f}",
-            f"{float(sample['longitude']):.6f}",
-            f"{float(sample.get('altitude') or 0):.1f}",
-            f"{float(sample.get('ground_speed') or 0):.1f}",
-            f"{float(sample.get('fuel_total') or 0):.2f}",
+            str(int(seq)),
+            str(int(t)),
+            js_to_fixed(float(sample["latitude"]), 6),
+            js_to_fixed(float(sample["longitude"]), 6),
+            js_to_fixed(float(sample.get("altitude") or 0), 1),
+            js_to_fixed(float(sample.get("ground_speed") or 0), 1),
+            js_to_fixed(float(sample.get("fuel_total") or 0), 2),
             "1" if sample.get("on_ground") else "0",
-            f"{rate:.2f}",
+            js_to_fixed(rate, 2),
         ]
     )
+
+
+def note_last_signed_t(t: Any) -> None:
+    try:
+        _LAST_SIGNED_T["t"] = int(t or 0)
+    except (TypeError, ValueError):
+        _LAST_SIGNED_T["t"] = 0
+
+
+def sign_point(session_key: str, seq: int, sample: dict, *, t: Optional[int] = None) -> dict:
+    with _SIGN_LOCK:
+        t_ms = int(t) if t is not None else now_ms()  # server clock (D5)
+        if seq > 0 and t_ms <= _LAST_SIGNED_T["t"]:
+            t_ms = _LAST_SIGNED_T["t"] + 1  # the server rejects times that run backwards
+        _LAST_SIGNED_T["t"] = t_ms
+    rate = float(sample.get("simulation_rate") or 1.0)
+    payload = track_sign_payload(seq, t_ms, sample)
     sig = hmac.new(session_key.encode("utf-8"), payload.encode("utf-8"), hashlib.sha256).hexdigest()
     out = dict(sample)
-    out.update({"seq": seq, "t": t, "sig": sig, "simulation_rate": rate})
+    out.update({"seq": seq, "t": t_ms, "sig": sig, "simulation_rate": rate})
     return out
 
 
@@ -3500,14 +5216,73 @@ def adopt_server_flight(flight: dict) -> None:
 
 
 _START_LOCK = threading.Lock()
+_END_LOCK = threading.Lock()
 
 
-def action_start() -> dict:
-    with _START_LOCK:
-        return _action_start()
+def action_start(from_queue: Optional[dict] = None, *, wait: bool = True) -> dict:
+    """Start a flight. Every way in (bridge, website gateway, hotkey, desktop UI,
+    start queue) goes through here – and through the version gate (D12)."""
+    if not _START_LOCK.acquire(blocking=wait):
+        raise RetryableError(t_ui("Start läuft bereits", "Start already running"), 5)
+    try:
+        try:
+            assert_start_allowed()
+        except VersionGateError as e:
+            if from_queue is not None:
+                clear_pending_start()
+            STATE.last_error = str(e)
+            notify_windows(
+                t_ui("FlyConomy – Update nötig", "FlyConomy – Update required"),
+                str(e),
+                code="FC-OUTDATED",
+                kind="error",
+            )
+            raise
+        return _action_start(from_queue)
+    finally:
+        _START_LOCK.release()
 
 
-def _action_start() -> dict:
+def _start_failed(msg: str, from_queue: Optional[dict], *, code: str = "FC-START", plain: bool = False) -> None:
+    STATE.last_error = msg
+    if from_queue is not None:
+        clear_pending_start()
+        if not plain:
+            msg = t_ui(f"Nachgeholter Start abgelehnt: {msg}", f"Queued start rejected: {msg}")
+        # the queue's "Start wird nachgeholt – NICHT losfliegen" must not stay up
+        STATE.set_ui_status(msg, msg)
+    STATE.log(msg)
+    notify_windows(
+        t_ui("FlyConomy – Start fehlgeschlagen", "FlyConomy – Start failed"),
+        msg,
+        code=code,
+        kind="error",
+    )
+
+
+def stranded_start_message() -> str:
+    return t_ui(
+        "Auf dem Server läuft bereits ein Flug, den dieser Client nicht aufzeichnet "
+        "(z. B. ging die Antwort auf „Flug starten“ unterwegs verloren). Ohne Aufzeichnung kann "
+        "er nicht geloggt werden – bitte im Panel „Abbrechen“ drücken und neu starten.",
+        "The server already has a flight that this client is not recording (e.g. the answer to "
+        "“Start flight” got lost). Without a recording it cannot be logged – please press "
+        "“Cancel” in the panel and start again.",
+    )
+
+
+def _usable_pending_start() -> Optional[dict]:
+    """The waiting start record, if it is still within its 10 minutes (D7)."""
+    rec = STATE.pending_start if isinstance(STATE.pending_start, dict) else load_pending_start()
+    if not isinstance(rec, dict) or not rec.get("client_session_key"):
+        return None
+    queued_at = float(rec.get("queued_at") or 0)
+    if not queued_at or time.time() - queued_at > PENDING_START_MAX_SEC:
+        return None
+    return rec
+
+
+def _action_start(from_queue: Optional[dict] = None) -> dict:
     try:
         STATE.api.refresh_session()
     except Exception:
@@ -3519,51 +5294,63 @@ def _action_start() -> dict:
         role = str((mf or {}).get("crew_role") or "")
         STATE.crew_guest = role == "crew"
         if STATE.crew_guest:
-            raise RuntimeError("Crewflug: nur der Captain startet den Flug.")
+            msg = "Crewflug: nur der Captain startet den Flug."
+            if from_queue is not None:
+                _start_failed(msg, from_queue)
+            raise RuntimeError(msg)
     except RuntimeError:
         raise
     except Exception:
         pass
     STATE.sim_io_pause = True
     try:
+        # D7: a manual start while a start waits in the queue uses the SAME
+        # client_session_key – never a second one (review S8).
+        pending = from_queue if from_queue is not None else _usable_pending_start()
+        resend_key = ""
         existing = None
         try:
             existing = STATE.api.get_active()
         except Exception:
             existing = None
         if existing and existing.get("id"):
-            STATE.active_flight_id = existing.get("id")
             # A running flight that we are not recording is the worst state to be
             # in: the leg gets rejected later for missing track points. Take it
             # over whenever we still hold its session key, either in memory or on
             # disk, instead of sending the pilot away.
             if not STATE.monitoring:
-                adopted = STATE.session_key is not None
-                if not adopted:
-                    adopted = load_flight_session() and str(STATE.active_flight_id) == str(
-                        existing.get("id")
-                    )
+                adopted = adopt_running_flight(existing)
                 if adopted:
-                    STATE.active_flight_id = existing.get("id")
-                    if not STATE.flight_started_at:
-                        STATE.flight_started_at = _parse_started_at(existing.get("started_at"))
-                    apply_flight_meta(
-                        {"flight": existing, "aircraft": existing}, STATE.flight_started_at
-                    )
-                    STATE.monitoring = True
-                    save_flight_session()
-                    STATE.log(
-                        "Laufender Flug übernommen – Aufzeichnung läuft weiter. "
-                        "Ende: Handbremse am Ziel."
-                    )
-                    STATE.set_ui_status("Flug übernommen", "Flight adopted")
+                    if pending is not None:
+                        clear_pending_start()
                     return {"ok": True, "adopted": True, "flight": existing}
-            raise RuntimeError(
-                "Es läuft bereits ein Flug. Ende: Handbremse am Ziel oder „Abbrechen“."
-            )
+                # Review S8 (C8/D7): our /start may have reached the server while the
+                # answer got lost. Send it again with the SAME client_session_key – a
+                # server with C8 answers with that flight and its session key; an old
+                # server says "bereits ein Flug" and the pilot is told what to do.
+                resend_key = str((pending or {}).get("client_session_key") or "")
+            if not resend_key:
+                if pending is not None:
+                    clear_pending_start()
+                STATE.active_flight_id = existing.get("id")
+                if not STATE.monitoring:
+                    # not recorded here and not adoptable: the parking brake can
+                    # never log it – say so (review S8)
+                    msg = stranded_start_message()
+                    STATE.last_error = msg
+                    STATE.set_ui_status(msg, msg)
+                    raise RuntimeError(msg)
+                raise RuntimeError(
+                    t_ui(
+                        "Es läuft bereits ein Flug. Ende: Handbremse am Ziel oder „Abbrechen“.",
+                        "A flight is already running. End: parking brake at the destination or “Cancel”.",
+                    )
+                )
         if not STATE.sim.connected:
             ok, msg = STATE.sim.connect()
             if not ok:
+                if from_queue is not None:
+                    raise RetryableError(msg, 15)
                 raise RuntimeError(msg)
         raw = None
         for _ in range(8):
@@ -3574,50 +5361,128 @@ def _action_start() -> dict:
                     break
             time.sleep(0.3)
         if not raw:
+            if from_queue is not None:
+                raise RetryableError("Keine Sim-Daten", 15)
             raise RuntimeError("Keine Sim-Daten – in MSFS sitzen und erneut verbinden.")
         sample = make_sample(raw)
         for k in ("aircraft_type", "atc_model", "atc_type"):
             if raw.get(k):
                 sample[k] = raw[k]
+        if from_queue is not None and not resend_key:
+            why = pending_start_moved(from_queue, sample)
+            if why:
+                clear_pending_start()
+                msg = t_ui(
+                    f"Wartender Start verworfen: {why}. Bitte am Boden neu starten.",
+                    f"Queued start dropped: {why}. Please start again on the ground.",
+                )
+                STATE.last_error = msg
+                STATE.set_ui_status(msg, msg)
+                STATE.log(msg)
+                notify_windows(
+                    t_ui("FlyConomy – Start verworfen", "FlyConomy – Start dropped"),
+                    msg,
+                    code="FC-START-DROPPED",
+                    kind="error",
+                )
+                return {"ok": False, "dropped": True, "message": msg}
+        # D7: our own key for this start, on disk before the request leaves. A
+        # retried /start (queue, crash) carries the same key; a server with C8
+        # then answers with the flight it already has instead of a second one.
+        record = dict(pending or {})
+        if not record.get("client_session_key"):
+            record["client_session_key"] = secrets.token_hex(32)
+        record.setdefault("queued_at", time.time())
+        here = {
+            "latitude": sample["latitude"],
+            "longitude": sample["longitude"],
+            "on_ground": bool(sample.get("on_ground")),
+            "ground_speed": sample.get("ground_speed"),
+        }
+        if from_queue is None:
+            record["pos"] = here  # the pilot pressed Start again – here
+        else:
+            record.setdefault("pos", here)
+        record.setdefault("state", "sending")
+        record["attempts"] = int(record.get("attempts") or 0) + 1
+        write_pending_start(record)
+        fuel_before: dict = {}
         try:
-            result = STATE.api.start_flight(sample)
+            fuel_before = STATE.sim.fuel_system_info()
+        except Exception:
+            fuel_before = {}
+        body = dict(sample)
+        body["client_session_key"] = record["client_session_key"]
+        body["client_version"] = CLIENT_VERSION
+        if fuel_before:
+            body["fuel_report"] = {"stage": "before_load", **fuel_before}
+        try:
+            result = STATE.api.start_flight(body)
             STATE.last_error = None
         except RetryableError as e:
-            queue_pending_start(str(e))
+            record["last_error"] = str(e)
+            record["next_try_at"] = time.time() + max(10, min(int(e.retry_after or 15), 60))
+            queue_pending_start(str(e), record)
+            if from_queue is not None:
+                raise
             return {
                 "ok": True,
                 "queued": True,
                 "message": t_ui(
-                    "Server kurz weg — Start wird automatisch nachgeholt. Sim nicht verlassen.",
-                    "Server briefly down — start will retry automatically. Stay in the sim.",
+                    "Server kurz weg — Start wird automatisch nachgeholt. NICHT losfliegen, im Sim bleiben.",
+                    "Server briefly down — start will retry automatically. Do NOT take off, stay in the sim.",
                 ),
             }
         except RuntimeError as e:
             msg = str(e)
-            STATE.last_error = msg
-            if "bereits ein Flug" in msg.lower() or "already" in msg.lower():
+            clear_pending_start()
+            already = "bereits ein flug" in msg.lower() or "already" in msg.lower()
+            if already:
                 try:
                     again = STATE.api.get_active()
                     if again and again.get("id"):
                         STATE.active_flight_id = again.get("id")
                 except Exception:
                     pass
-            notify_windows(
-                t_ui("FlyConomy – Start fehlgeschlagen", "FlyConomy – Start failed"),
-                msg,
-                code="FC-START",
-                kind="error",
-            )
+            if already and resend_key:
+                # Old server without C8: the flight exists, we cannot record it.
+                msg = stranded_start_message()
+                _start_failed(msg, from_queue, code="FC-START-STRANDED", plain=True)
+                if from_queue is None:
+                    STATE.set_ui_status(msg, msg)
+                raise RuntimeError(msg) from e
+            _start_failed(msg, from_queue if from_queue is not None else None)
             raise
-        STATE.active_flight_id = result.get("flight", {}).get("id")
+        STATE.active_flight_id = (result.get("flight") or {}).get("id")
         session_key = result.get("session_key")
         if not session_key:
+            clear_pending_start()
             raise RuntimeError("Server lieferte keinen session_key – Backend aktualisieren.")
         with STATE.lock:
             STATE.session_key = session_key
             STATE.track_seq = 0
             STATE.local_track = [sign_point(session_key, 0, sample)]
             STATE.track_seq = 1
+        STATE.flight_started_at = time.time()
+        STATE._flight_title = str(sample.get("aircraft_type") or "")
+        STATE._max_gs_seen = 0.0
+        note_max_gs(sample.get("ground_speed"))
+        msr = _finite(result.get("max_sim_rate"), 0.0)
+        STATE.max_sim_rate = msr if msr > 0 else MAX_SIM_RATE
+        STATE.from_icao = str(result.get("from_icao") or "").upper() or None
+        STATE.to_icao = None
+        _clear_mismatch()
+        # D3: the session is on disk before anything else can go wrong – and only
+        # then the queue record goes (a crash in between keeps one of the two).
+        save_flight_session()
+        clear_pending_start()
+        if resend_key:
+            STATE.log(
+                t_ui(
+                    "Server hat den bereits angelegten Flug bestätigt – Aufzeichnung läuft.",
+                    "The server confirmed the flight it had already created – recording runs.",
+                )
+            )
 
         load = result.get("load") or {}
         load["sim_title"] = sample.get("aircraft_type") or raw.get("aircraft_type") or ""
@@ -3754,6 +5619,19 @@ def _action_start() -> dict:
                 f"Fenix/Payware: Fuel nicht direkt gesetzt (Soll {kg:.0f} kg). "
                 "Im EFB Mass & Balance laden — am Gate zählt das nicht als Cheat."
             )
+        # E7: fuel before/after the load, the sim's fuel system and capacity go to
+        # the server with the next tracking ping (an old server ignores the field).
+        try:
+            after = STATE.sim.fuel_system_info()
+        except Exception:
+            after = {}
+        STATE._fuel_report_due = {
+            "stage": "after_load",
+            "fuel_before_load_gal": (fuel_before or {}).get("fuel_total_gal"),
+            "fuel_after_load_gal": (after or {}).get("fuel_total_gal"),
+            "planned_gal": _finite(load.get("fuel_gallons"), 0.0),
+            **{k: v for k, v in (after or {}).items() if k != "fuel_total_gal"},
+        }
         save_flight_session()
         schedule_cockpit_ack("start")
         return result
@@ -3761,7 +5639,152 @@ def _action_start() -> dict:
         STATE.sim_io_pause = False
 
 
-def action_end(*, notify: bool = True, persist_retry: bool = True) -> dict:
+def adopt_running_flight(existing: dict) -> bool:
+    """'Flug starten' while the server already runs a flight: take it over from
+    memory or from the session file – never with data of another flight (D1.7)."""
+    fid = existing.get("id")
+    if STATE.session_key and STATE.active_flight_id is not None and str(STATE.active_flight_id) == str(fid):
+        pass  # the session is in memory already
+    else:
+        data = read_flight_session_file()
+        if not data or str(data.get("flight_id")) != str(fid):
+            if existing.get("session_key"):
+                adopt_server_flight(existing)
+                return True
+            return False
+        apply_flight_session(data, restored=True)
+    STATE.active_flight_id = fid
+    if not STATE.flight_started_at:
+        STATE.flight_started_at = _parse_started_at(existing.get("started_at"))
+    if not STATE.aircraft_label:
+        # keep the stored load/fuel data – /flights/active carries none (D1.7)
+        apply_flight_meta({"flight": existing, "aircraft": existing}, STATE.flight_started_at, keep_load=True)
+    STATE.monitoring = True
+    save_flight_session()
+    STATE.restore_state = "restored"
+    STATE.log(
+        t_ui(
+            "Laufender Flug übernommen – Aufzeichnung läuft weiter. Ende: Handbremse am Ziel.",
+            "Running flight taken over – recording continues. End: parking brake at the destination.",
+        )
+    )
+    STATE.set_ui_status("Flug übernommen", "Flight adopted")
+    return True
+
+
+def _ensure_end_session() -> str:
+    """D1.5: after a restart the session may only be on disk – load it first."""
+    with STATE.lock:
+        key = STATE.session_key
+    if key:
+        return key
+    data = read_flight_session_file()
+    if data and (
+        STATE.active_flight_id is None or str(data.get("flight_id")) == str(STATE.active_flight_id)
+    ):
+        apply_flight_session(data, restored=True)
+        with STATE.lock:
+            return str(STATE.session_key or "")
+    if STATE.active_flight_id is not None and not STATE.monitoring:
+        # the server flight is known, but neither memory nor disk has its session
+        # – "Flug starten" cannot take it over either (review S8)
+        raise RuntimeError(stranded_start_message())
+    raise RuntimeError(
+        t_ui(
+            "Keine lokale Flug-Session. Bitte „Flug starten“ drücken (übernimmt den laufenden Flug), "
+            "danach erneut loggen.",
+            "No local flight session. Press “Start flight” (takes over the running flight), "
+            "then log again.",
+        )
+    )
+
+
+def _build_end_payload(session_key: str) -> tuple:
+    raw = STATE.sim.read() if STATE.sim.connected else None
+    if not raw:
+        with STATE.lock:
+            raw = dict(STATE.last_sample) if STATE.last_sample else None
+    if not raw:
+        raise RuntimeError(
+            "Keine Sim-Daten – MSFS verbinden. Flugende: Handbremse, oder „Abbrechen“."
+        )
+    sample = make_sample(raw)
+    gs_end = float(sample.get("ground_speed") or 0)
+    agl_end = _agl_from(sample.get("alt_agl"))
+    # Only when actually parked (not 25 kt on short final). Airliners with
+    # custom tanks used to be forced on_ground up to 25 kt — that logged airborne.
+    if gs_end <= PARK_GS_KT_AIRLINER and (
+        bool(sample.get("parking_brake"))
+        or bool(sample.get("on_ground_sim"))
+        or agl_end is None
+        or agl_end < PARK_AGL_FT
+    ):
+        sample["on_ground"] = True
+    with STATE.lock:
+        track = list(STATE.local_track)
+        seq = STATE.track_seq
+    if not sample_plausible(sample):
+        prev = None
+        with STATE.lock:
+            prev = dict(STATE.last_sample) if STATE.last_sample else None
+        if prev and sample_plausible(prev):
+            sample = make_sample(prev)
+        else:
+            raise KeepFlyingError(
+                t_ui(
+                    "Position ungültig (Simulator lädt oder Menü). Nicht loggen – der Flug läuft weiter.",
+                    "Invalid position (sim loading or menu). Do not log – the flight continues.",
+                ),
+                "BAD_POSITION",
+            )
+    track.append(sign_point(session_key, seq, sample))
+    seq += 1
+    while len(track) < MIN_TRACK_POINTS:
+        time.sleep(0.02)
+        track.append(sign_point(session_key, seq, sample))
+        seq += 1
+    before = len(track)
+    track = compact_track(track, MAX_TRACK_POINTS_SEND)
+    if before != len(track):
+        STATE.log(f"Track gekürzt für Upload: {before} → {len(track)} Punkte")
+    end_sample = {
+        "latitude": track[-1]["latitude"],
+        "longitude": track[-1]["longitude"],
+        "altitude": track[-1].get("altitude"),
+        "ground_speed": track[-1].get("ground_speed"),
+        "heading": track[-1].get("heading"),
+        "fuel_total": track[-1].get("fuel_total"),
+        "on_ground": track[-1].get("on_ground", True),
+        "simulation_rate": track[-1].get("simulation_rate", 1),
+        "alt_agl": sample.get("alt_agl"),
+    }
+    payload = dict(end_sample)
+    payload["track"] = track
+    payload["session_key"] = session_key
+    return payload, track, seq
+
+
+def action_end(*, notify: bool = True, persist_retry: bool = False) -> dict:
+    """Send the flight end. Only one at a time (D2); the payload is on disk before
+    it is sent and is resent unchanged until the server confirms (D6).
+
+    persist_retry=True only changes the answer on a temporary error ("queued" for
+    the retry loop instead of "retry"); the session always stays until the server
+    has decided (review S8: it used to be dropped here)."""
+    if not _END_LOCK.acquire(timeout=0.2):
+        return {
+            "retry": True,
+            "busy": True,
+            "message": t_ui("Flugende wird gerade gesendet…", "Flight end is being sent…"),
+            "retry_after_seconds": 4,
+        }
+    try:
+        return _action_end(notify=notify, persist_retry=persist_retry)
+    finally:
+        _END_LOCK.release()
+
+
+def _action_end(*, notify: bool, persist_retry: bool) -> dict:
     try:
         STATE.api.refresh_session()
     except Exception:
@@ -3770,80 +5793,45 @@ def action_end(*, notify: bool = True, persist_retry: bool = True) -> dict:
         raise RuntimeError("Nicht angemeldet")
     STATE.sim_io_pause = True
     try:
-        raw = STATE.sim.read() if STATE.sim.connected else None
-        if not raw:
-            with STATE.lock:
-                raw = dict(STATE.last_sample) if STATE.last_sample else None
-        if not raw:
-            raise RuntimeError(
-                "Keine Sim-Daten – MSFS verbinden. Flugende: Handbremse, oder „Abbrechen“."
-            )
-        sample = make_sample(raw)
-        gs_end = float(sample.get("ground_speed") or 0)
-        agl_end = _agl_from(sample.get("alt_agl"))
-        # Only when actually parked (not 25 kt on short final). Airliners with
-        # custom tanks used to be forced on_ground up to 25 kt — that logged airborne.
-        if gs_end <= PARK_GS_KT_AIRLINER and (
-            bool(sample.get("parking_brake"))
-            or bool(sample.get("on_ground_sim"))
-            or agl_end is None
-            or agl_end < PARK_AGL_FT
-        ):
-            sample["on_ground"] = True
-        with STATE.lock:
-            session_key = STATE.session_key
-            if not session_key:
-                raise RuntimeError(
-                    "Keine lokale Flug-Session (Client neu gestartet). Bitte „Abbrechen“ und neu starten."
-                )
-            track = list(STATE.local_track)
+        session_key = _ensure_end_session()
+        flight_id = STATE.active_flight_id
+        record = pending_end_for(flight_id, session_key)
+        track_extended = False
+        if record:
+            # Same end as before (sent already, answer lost or server down):
+            # resend it unchanged – position and time of the real landing.
+            payload = dict(record.get("payload") or {})
+            track: list = list(payload.get("track") or [])
             seq = STATE.track_seq
-        if not sample_plausible(sample):
-            prev = None
-            with STATE.lock:
-                prev = dict(STATE.last_sample) if STATE.last_sample else None
-            if prev and sample_plausible(prev):
-                sample = make_sample(prev)
-            else:
-                raise KeepFlyingError(
-                    t_ui(
-                        "Position ungültig (Simulator lädt oder Menü). Nicht loggen – der Flug läuft weiter.",
-                        "Invalid position (sim loading or menu). Do not log – the flight continues.",
-                    ),
-                    "BAD_POSITION",
-                )
-        track.append(sign_point(session_key, seq, sample))
-        seq += 1
-        while len(track) < MIN_TRACK_POINTS:
-            time.sleep(0.02)
-            track.append(sign_point(session_key, seq, sample))
-            seq += 1
-        before = len(track)
-        track = compact_track(track, MAX_TRACK_POINTS_SEND)
-        if before != len(track):
-            STATE.log(f"Track gekürzt für Upload: {before} → {len(track)} Punkte")
-        end_sample = {
-            "latitude": track[-1]["latitude"],
-            "longitude": track[-1]["longitude"],
-            "altitude": track[-1].get("altitude"),
-            "ground_speed": track[-1].get("ground_speed"),
-            "heading": track[-1].get("heading"),
-            "fuel_total": track[-1].get("fuel_total"),
-            "on_ground": track[-1].get("on_ground", True),
-            "simulation_rate": track[-1].get("simulation_rate", 1),
-            "alt_agl": sample.get("alt_agl"),
-        }
-        payload = dict(end_sample)
-        payload["track"] = track
-        payload["session_key"] = session_key
+        else:
+            payload, track, seq = _build_end_payload(session_key)
+            track_extended = True
+            record = persist_pending_end(payload, flight_id)
+
+        def keep_track() -> None:
+            if track_extended:
+                with STATE.lock:
+                    STATE.local_track = track
+                    STATE.track_seq = seq
+                save_flight_session()
 
         try:
             result = STATE.api.submit_end(payload)
         except RetryableError as e:
+            busy = isinstance(e, EndBusyError)
+            update_pending_end(
+                record,
+                attempts=int(record.get("attempts") or 0) + 1,
+                last_error=str(e),
+                next_try_at=time.time() + max(5, int(e.retry_after or 15)),
+            )
             if not persist_retry:
-                return {"retry": True, "message": str(e), "retry_after_seconds": e.retry_after}
-            queue_pending_end(payload, str(e))
-            _clear_flight_runtime()
+                return {
+                    "retry": True,
+                    "busy": busy,
+                    "message": str(e),
+                    "retry_after_seconds": 6 if busy else e.retry_after,
+                }
             return {
                 "queued": True,
                 "message": (
@@ -3855,10 +5843,8 @@ def action_end(*, notify: bool = True, persist_retry: bool = True) -> dict:
         except AirportRejectedError as e:
             # Flight keeps running: restore the local track, tell the pilot, then
             # let them take off again toward a big airport.
-            with STATE.lock:
-                STATE.local_track = track
-                STATE.track_seq = seq
-            save_flight_session()
+            clear_pending_end()
+            keep_track()
             STATE._park_ticks = 0
             STATE._auto_end_cooldown_until = time.time() + HEAVY_AIRPORT_COOLDOWN_SEC
             STATE.last_error = str(e)
@@ -3873,17 +5859,16 @@ def action_end(*, notify: bool = True, persist_retry: bool = True) -> dict:
                     code="FC-AIRPORT-TOO-SMALL",
                     kind="error",
                 )
-            return {"rejected": True, "message": str(e), "airport": e.airport}
+            return {"rejected": True, "keep_flying": True, "message": str(e), "airport": e.airport}
         except KeepFlyingError as e:
-            with STATE.lock:
-                STATE.local_track = track
-                STATE.track_seq = seq
-            save_flight_session()
+            code = getattr(e, "code", None) or "KEEP_FLYING"
+            if code != "TOKEN":
+                clear_pending_end()  # this payload cannot succeed; the next try builds anew
+            keep_track()
             STATE.last_error = str(e)
             STATE.log(str(e))
             STATE._park_ticks = 0
             STATE._auto_end_cooldown_until = time.time() + AUTO_END_FAIL_COOLDOWN_SEC
-            code = getattr(e, "code", None) or "KEEP_FLYING"
             if notify:
                 notify_windows(
                     t_ui("FlyConomy – Flug läuft weiter", "FlyConomy – Flight continues"),
@@ -3892,7 +5877,44 @@ def action_end(*, notify: bool = True, persist_retry: bool = True) -> dict:
                     kind="error",
                 )
             return {"keep_flying": True, "message": str(e), "code": code}
+        except FlightClosedError as e:
+            clear_pending_end()
+            msg = str(e)
+            note_session_ended(session_key, flight_id)
+            _clear_flight_runtime()
+            STATE.last_error = msg
+            STATE.log(f"Flug beendet (Server): {msg}")
+            if notify:
+                notify_windows(
+                    t_ui("FlyConomy – Flug beendet", "FlyConomy – Flight ended"),
+                    msg,
+                    code="FC-END-REJECTED",
+                    kind="error",
+                )
+            return {"rejected": True, "message": msg, "code": getattr(e, "code", "")}
+        except NoActiveFlightError as e:
+            clear_pending_end()
+            gone = True
+            try:
+                gone = not STATE.api.get_active()
+            except Exception:
+                gone = False
+            msg = t_ui(
+                "Der Flug ist auf dem Server nicht mehr aktiv – vermutlich wurde er schon geloggt. "
+                "Bitte auf der Website unter „Flüge“ nachsehen.",
+                "The flight is no longer active on the server – it was probably logged already. "
+                "Please check “Flights” on the website.",
+            )
+            STATE.last_error = msg
+            STATE.log(f"{msg} ({e})")
+            if gone:
+                note_session_ended(session_key, flight_id)
+                _clear_flight_runtime()
+                return {"rejected": True, "unknown": True, "message": msg}
+            keep_track()
+            return {"keep_flying": True, "message": msg, "code": "FC-END-UNKNOWN"}
         except Exception as e:
+            clear_pending_end()
             msg = str(e)
             low = msg.lower()
             permanent = any(
@@ -3910,6 +5932,7 @@ def action_end(*, notify: bool = True, persist_retry: bool = True) -> dict:
             except Exception:
                 still_active = True  # unknown – keep local if not clearly permanent
             if permanent or not still_active:
+                note_session_ended(session_key, flight_id)
                 _clear_flight_runtime()
                 STATE.last_error = msg
                 STATE.log(f"Flug beendet (Server): {msg}")
@@ -3921,16 +5944,19 @@ def action_end(*, notify: bool = True, persist_retry: bool = True) -> dict:
                         kind="error",
                     )
                 return {"rejected": True, "message": msg}
-            with STATE.lock:
-                STATE.local_track = track
-                STATE.track_seq = seq
-            save_flight_session()
+            keep_track()
             raise
 
+        clear_pending_end()
+        note_session_ended(session_key, flight_id or result.get("flight_id"), result)
         _clear_flight_runtime()
+        remember_end_result(result)
         STATE.set_ui_status("Flug beendet", "Flight ended")
+        status = (result.get("validation") or {}).get("status") or (
+            "bereits geloggt" if result.get("already_logged") else "?"
+        )
         STATE.log(
-            f"Flug beendet – Status {result.get('validation', {}).get('status')} "
+            f"Flug beendet – Status {status} "
             f"Pay ${result.get('total_payment', 0)} · Track {len(track)} Punkte (signiert)"
         )
         if notify and not result.get("queued"):
@@ -3947,6 +5973,28 @@ def action_cancel() -> dict:
         result = STATE.api.cancel_flight() or {}
     except Exception as e:
         result = {"error": str(e)}
+    if isinstance(result, dict) and str(result.get("code") or "") == "END_BUSY":
+        # Server stage C2: an /end of this flight is being processed right now, so the flight
+        # was NOT cancelled. Keep the queued end and the session – the end goes on (or the
+        # queued end is resent later); never show "Flug abgebrochen" for a flight that may be paid.
+        msg = t_ui(
+            "Das Flugende wird gerade verarbeitet – Abbrechen ist im Moment nicht möglich. "
+            "Bitte kurz warten.",
+            "The flight end is being processed right now – cancelling is not possible at the moment. "
+            "Please wait a moment.",
+        )
+        STATE.log(msg)
+        return {"ok": False, "code": "END_BUSY", "error": msg, "flight_id": result.get("flight_id")}
+    key = current_end_session_key()
+    record = pending_end_for(STATE.active_flight_id, key or STATE.session_key)
+    # Review S8: remembered first, so a flush that is sending right now can never
+    # write this end back to disk (update_pending_end checks it).
+    note_session_ended(key, STATE.active_flight_id)
+    if record:
+        note_session_ended((record.get("payload") or {}).get("session_key"), record.get("flight_id"))
+        clear_pending_end()  # a cancelled flight has no end to resend
+    if STATE.pending_start or file_or_bak_exists(PENDING_START_PATH):
+        clear_pending_start()  # "Abbrechen" also stops a start that is still waiting
     _clear_flight_runtime()
     STATE.set_ui_status("Bereit", "Ready")
     STATE.log("Flug abgebrochen / Client-Session bereinigt")
@@ -4405,14 +6453,47 @@ def action_economy_refuel(body: dict) -> dict:
     }
 
 
+def apply_load_blocked_reason() -> Optional[str]:
+    """D11: no tank/payload writes once a flight has left the gate.
+
+    At the gate (flight started, still parked) only the payload may be pushed
+    again – never fuel; after departure nothing at all."""
+    if not (STATE.monitoring or STATE.active_flight_id):
+        return None
+    sample = STATE.last_sample or {}
+    gs = _finite(sample.get("ground_speed"))
+    if (
+        STATE._was_airborne
+        or float(STATE._max_nm_from_origin or 0) >= 1.0
+        or not bool(sample.get("on_ground", True))
+        or gs > REFUEL_STATIONARY_GS_KT
+    ):
+        return t_ui(
+            "„Ins EFB laden“ ist während des Flugs gesperrt.",
+            "“Load to EFB” is locked during the flight.",
+        )
+    return None
+
+
 def action_apply_load() -> dict:
     """Push FlyConomy pax/fuel/payload into the sim (Fenix EFB / SimConnect)."""
     if not STATE.sim.connected:
         raise RuntimeError(t_ui("MSFS nicht verbunden", "MSFS not connected"))
+    blocked = apply_load_blocked_reason()
+    if blocked:
+        raise RuntimeError(blocked)
     load = _economy_load_dict()
     if not load:
         raise RuntimeError(t_ui("Keine Beladung", "No load data"))
-    applied = STATE.sim.apply_economy_load(load)
+    in_flight = bool(STATE.monitoring or STATE.active_flight_id)
+    custom = False
+    try:
+        custom = STATE.sim.has_custom_fuel(str(load.get("sim_title") or ""))
+    except Exception:
+        custom = False
+    # Started but still at the gate: payload only (custom-fuel types never get
+    # tank writes anyway; for all others repair=True skips the fuel).
+    applied = STATE.sim.apply_economy_load(load, repair=bool(in_flight and not custom))
     if STATE.economy_registration:
         STATE.sim.set_atc_id(STATE.economy_registration)
     STATE.set_ui_status("Beladung ins Flugzeug", "Load applied to aircraft")
@@ -4764,6 +6845,13 @@ def execute_gateway_command(cmd: dict, start_result: Optional[tuple] = None) -> 
             GATEWAY.send_result(cmd_id, ok=True, data=data)
             return start_result
         raise RuntimeError(f"unknown action {action}")
+    except VersionGateError as e:
+        # The website opens its update dialog from these flags (like bridge /start 409).
+        data = {"ok": False, "code": "FC-OUTDATED", "message": str(e), **(e.info or {})}
+        GATEWAY.send_result(cmd_id, ok=False, error=str(e), data=data)
+        if action == "start":
+            return (False, data, str(e))
+        return start_result
     except Exception as e:
         GATEWAY.send_result(cmd_id, ok=False, error=str(e))
         if action == "start":
@@ -4884,8 +6972,23 @@ def start_discord_claim_login() -> dict:
     return {"ok": True, "url": url, "message": "Website geöffnet. Nach Discord-Login verbindet sich der Client."}
 
 
-def wait_claim_token(nonce: str) -> None:
-    deadline = time.time() + 120
+def claim_wait_pause(status: int, retry_after: Any = None) -> float:
+    """Seconds to wait before the next long-poll (0 = ask again right away).
+
+    408/204 are the server's own 20 s long-poll answers. Everything else (429 rate
+    limit, 400, 503, 200 without token) used to loop without any pause (§9.6)."""
+    if status in (408, 204):
+        return 0.0
+    if status == 429:
+        try:
+            return max(2.0, min(float(retry_after), 30.0)) if retry_after is not None else 5.0
+        except (TypeError, ValueError):
+            return 5.0
+    return 3.0
+
+
+def wait_claim_token(nonce: str, *, deadline_sec: float = 120.0) -> None:
+    deadline = time.time() + deadline_sec
     while time.time() < deadline:
         try:
             r = requests.get(
@@ -4894,7 +6997,11 @@ def wait_claim_token(nonce: str) -> None:
                 timeout=25,
             )
             if r.status_code == 200:
-                token = str((r.json() or {}).get("token") or "")
+                token = ""
+                try:
+                    token = str((r.json() or {}).get("token") or "")
+                except Exception:
+                    token = ""
                 if token:
                     ok, msg = STATE.api.login(None, token)
                     STATE.log(msg)
@@ -4902,11 +7009,12 @@ def wait_claim_token(nonce: str) -> None:
             if r.status_code == 410:
                 STATE.log("Login-Code bereits verwendet oder abgelaufen.")
                 return
-            if r.status_code in (408, 204):
-                continue
+            pause = claim_wait_pause(r.status_code, (r.headers or {}).get("Retry-After"))
+            if pause > 0:
+                time.sleep(pause)
         except Exception as e:
             STATE.log(f"Claim-Wait: {e}")
-            time.sleep(1)
+            time.sleep(2)
     msg = t_ui(
         "Browser-Login nicht fertig. Bitte im MiniClient erneut auf Anmelden klicken.",
         "Browser login did not finish. Please sign in again from the MiniClient.",
@@ -4915,533 +7023,611 @@ def wait_claim_token(nonce: str) -> None:
     notify_windows(t_ui("FlyConomy – Login", "FlyConomy – Login"), msg, code="FC-LOGIN", kind="error")
 
 
+def _title_changed(raw: dict) -> bool:
+    """Other aircraft or the 2024 avatar: the sample is not our aircraft (E7)."""
+    title = str(raw.get("aircraft_type") or "").strip()
+    expected = str(STATE._flight_title or "").strip()
+    if not title or not expected:
+        if title and not expected:
+            STATE._flight_title = title
+        STATE._title_mismatch_ticks = 0
+        return False
+    if title == expected:
+        STATE._title_mismatch_ticks = 0
+        return False
+    if not feature_enabled("title_pause"):
+        # Review S8: no pause without the switch (2.11.12 behaviour) – a persistent
+        # livery/title change would otherwise stop recording and auto-end for good.
+        STATE._title_mismatch_ticks = 0
+        if not STATE._title_change_logged:
+            STATE._title_change_logged = True
+            STATE.log_only(
+                t_ui(
+                    f"Hinweis: anderer Flugzeugname im Sim („{title[:40]}“, Start: „{expected[:40]}“) – "
+                    "die Aufzeichnung läuft weiter.",
+                    f"Note: different aircraft name in the sim (“{title[:40]}”, start: “{expected[:40]}”) – "
+                    "recording continues.",
+                )
+            )
+        return False
+    STATE._title_mismatch_ticks += 1
+    if STATE._title_mismatch_ticks == TITLE_CHANGE_TICKS:
+        msg = t_ui(
+            f"Anderes Flugzeug im Sim („{title[:40]}“) – Aufzeichnung pausiert, bis das "
+            f"Flugzeug des Flugs wieder geladen ist („{expected[:40]}“). Der Flug ist nicht abgebrochen.",
+            f"Another aircraft in the sim (“{title[:40]}”) – recording paused until the "
+            f"flight's aircraft is loaded again (“{expected[:40]}”). The flight is not cancelled.",
+        )
+        STATE.log(msg)
+        STATE.set_ui_status(msg, msg)
+        notify_windows(
+            t_ui("FlyConomy – anderes Flugzeug", "FlyConomy – other aircraft"),
+            msg,
+            code="FC-AIRCRAFT-CHANGED",
+            kind="info",
+        )
+        try:
+            STATE.sim._custom_fuel = None  # re-check custom tanks after a reload
+        except Exception:
+            pass
+    return STATE._title_mismatch_ticks >= TITLE_CHANGE_TICKS
+
+
+def _ground_glitch(raw: dict) -> bool:
+    if not raw.get("ground_glitch"):
+        return False
+    if not STATE._ground_glitch_logged:
+        STATE._ground_glitch_logged = True
+        STATE.log(
+            t_ui(
+                "SimConnect meldet „am Boden“ in großer Höhe – diese Proben werden verworfen.",
+                "SimConnect reports “on ground” high up – those samples are discarded.",
+            )
+        )
+    return True
+
+
+def monitor_tick() -> None:
+    """One second of the monitor: read the sim, record, check, ping, auto-end."""
+    drain_gateway_commands()
+    process_ground_queue(allow_fire=not STATE.sim_io_pause)
+    if STATE.sim_io_pause:
+        return
+
+    monitoring = _monitoring_active()
+
+    if monitoring and not _msfs_process_running():
+        note_sim_gap("process")
+        return
+
+    if not STATE.sim.connected:
+        STATE._gsx_cached = False
+        STATE._custom_fuel_cached = False
+        if monitoring:
+            note_sim_gap("disconnected")
+        else:
+            # Without a flight the link used to stay dead until someone
+            # clicked "connect" – reconnect on our own instead.
+            now_t = time.time()
+            if now_t >= STATE._idle_reconnect_at and _msfs_process_running():
+                STATE._idle_reconnect_at = now_t + IDLE_RECONNECT_SEC
+                try:
+                    ok, msg = STATE.sim.connect()
+                except Exception:
+                    ok, msg = False, ""
+                if ok:
+                    STATE.log(msg)
+        return
+
+    t_read = time.time()
+    raw = STATE.sim.read()
+    try:
+        STATE.sim.note_read_ms((time.time() - t_read) * 1000.0)
+    except Exception:
+        pass
+    if _monitoring_active() != monitoring:
+        # Review S8: restore, start or end changed the flight in another thread while
+        # SimConnect was read – this sample belongs to the old state; the next tick
+        # runs the gap/position checks for the new one.
+        return
+    if raw and monitoring and not sample_plausible(raw):
+        raw = None
+    if not raw:
+        # D9: one failed read is no gap – only three in a row (or one already open).
+        STATE._read_misses += 1
+        if monitoring and (STATE._read_misses >= SIM_MISS_GAP_TICKS or STATE._sim_gap_since):
+            note_sim_gap("data")
+        return
+    STATE._read_misses = 0
+
+    if monitoring:
+        if _title_changed(raw):
+            note_sim_gap("title")
+            with STATE.lock:
+                STATE.last_sample = raw
+            return
+        if _ground_glitch(raw):
+            return  # D8: "on ground" at altitude – neither recorded nor checked
+        note_recent_sample(raw)
+
+    if monitoring and STATE._sim_gap_since:
+        resume_after_gap(raw)
+        monitoring = _monitoring_active()
+        if monitoring and STATE._sim_gap_since:
+            # one odd sample after the gap – wait for the next one (GAP_CONFIRM_TICKS)
+            with STATE.lock:
+                STATE.last_sample = raw
+            return
+
+    slew_now = bool(raw.get("is_slew"))
+    sim_paused_now = bool(raw.get("paused"))
+    if monitoring and slew_now:
+        STATE._slew_strikes += 1
+        if STATE._slew_strikes >= TELEPORT_CONFIRM_TICKS:
+            abort_active_flight("slew")
+        with STATE.lock:
+            STATE.last_sample = raw
+        return
+    STATE._slew_strikes = 0
+    if monitoring and sim_paused_now:
+        begin_tracking_pause("sim")
+        STATE._sim_paused = True
+        with STATE.lock:
+            STATE.last_sample = raw
+        if (
+            STATE._position_mismatch
+            and STATE._mismatch_kind == "gap"
+            and not feature_enabled("suspect_report")
+        ):
+            # Final check S8: the "gap" question is open and MSFS is paused (Esc
+            # menu, "Ready to Fly" screen after a reload). The far position must not
+            # go out here either – the server checks every ping, paused ones too,
+            # and far positions can make it end the flight.
+            ping_mismatch_ref()
+        else:
+            ping_paused_tracking(raw)
+        return
+    if monitoring and STATE._sim_paused:
+        # Active pause / Pause-at-TOD just ended. Raising simrate often
+        # hitch-pauses MSFS; the aircraft keeps flying in sim time, so
+        # a hard 3 nm cut treated honest 16× as a teleport.
+        moved = 0.0
+        prev_pos = STATE._last_pos or STATE._resume_ref or {}
+        try:
+            moved = nm_between(
+                float(prev_pos["latitude"]),
+                float(prev_pos["longitude"]),
+                float(raw["latitude"]),
+                float(raw["longitude"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            moved = 0.0
+        pause_sec = (
+            time.time() - float(STATE._pause_started_at)
+            if STATE._pause_started_at
+            else 2.0
+        )
+        if prev_pos and prev_pos.get("t"):
+            pause_sec = max(pause_sec, (now_ms() - float(prev_pos["t"])) / 1000.0)
+        note_sim_rate(raw.get("simulation_rate"))
+        allowed = allowed_resume_nm(
+            pause_sec,
+            (prev_pos or {}).get("simulation_rate"),
+            raw.get("simulation_rate"),
+        )
+        if moved > allowed:
+            # Q32: never cancel for the position – pause, report, let the server decide.
+            STATE._sim_paused = False
+            enter_position_mismatch(
+                "jump",
+                raw,
+                prev_pos or None,
+                moved_nm=round(moved, 1),
+                allowed_nm=round(allowed, 1),
+                pause_sec=int(pause_sec),
+                after="pause",
+            )
+            with STATE.lock:
+                STATE.last_sample = raw
+            return
+        end_tracking_pause()
+        STATE.log(
+            t_ui(
+                "Pause beendet – Track und Zeit laufen weiter.",
+                "Pause ended – track and time continue.",
+            )
+        )
+    if monitoring and STATE._position_mismatch:
+        still = position_mismatch_tick(raw)
+        with STATE.lock:
+            STATE.last_sample = raw
+        if still or not _monitoring_active():
+            return
+    try:
+        STATE._gsx_cached = bool(STATE.sim.gsx_running())
+        STATE._custom_fuel_cached = bool(STATE.sim.has_custom_fuel())
+    except Exception:
+        pass
+    sample = None
+    do_atc = False
+    parked_ready = False
+    with STATE.lock:
+        STATE.last_sample = raw
+        # `monitoring` (this tick went through the gap/position checks) AND the
+        # current state – a session restored mid-tick is never recorded unchecked.
+        if monitoring and STATE.monitoring and STATE.session_key:
+            sample = make_sample(raw)
+            note_sim_rate(sample.get("simulation_rate"))
+            note_max_gs(sample.get("ground_speed"))
+            tnow = now_ms()
+            prev_pos = STATE._last_pos
+            jumped = False
+            if prev_pos:
+                dt_sec = max(0.5, (tnow - int(prev_pos.get("t") or tnow)) / 1000.0)
+                jump_nm = nm_between(
+                    float(prev_pos["latitude"]),
+                    float(prev_pos["longitude"]),
+                    sample["latitude"],
+                    sample["longitude"],
+                )
+                max_nm = allowed_move_nm(
+                    dt_sec,
+                    sample.get("simulation_rate"),
+                    prev_pos.get("simulation_rate"),
+                    gs_kt=_finite(sample.get("ground_speed"), 0.0),
+                )
+                if jump_nm > max_nm:
+                    # A single stray coordinate is a SimConnect glitch, not a
+                    # teleport: keep the old reference and wait for the next
+                    # sample to confirm the aircraft really moved.
+                    jumped = True
+                    STATE._teleport_strikes += 1
+                    need = 2 if jump_nm > 400 else 3
+                    if STATE._teleport_strikes >= need:
+                        sample = {
+                            **sample,
+                            "_jump_suspect": True,
+                            "_jump_nm": jump_nm,
+                            "_allowed_nm": max_nm,
+                            "_ref": dict(prev_pos),
+                        }
+                else:
+                    STATE._teleport_strikes = 0
+            if not jumped:
+                STATE._last_pos = {
+                    "latitude": sample["latitude"],
+                    "longitude": sample["longitude"],
+                    "simulation_rate": _finite(sample.get("simulation_rate"), 1.0),
+                    "t": tnow,
+                }
+                STATE._resume_ref = _pos_ref(sample, tnow)
+            last = STATE.local_track[-1] if STATE.local_track else None
+            last_t = int(last.get("t") or 0) if last else 0
+            elapsed_ms = flight_elapsed_now() * 1000
+            interval_ms = (
+                TRACK_INTERVAL_SHORT_MS
+                if elapsed_ms < TRACK_DENSE_FOR_MS
+                else TRACK_INTERVAL_MS
+            )
+            due = not last or (tnow - last_t) >= interval_ms
+            rate_now = _finite(sample.get("simulation_rate"), 1.0)
+            # D10: a point that falls due above the allowed simrate waits.
+            rate_ok = rate_now <= float(STATE.max_sim_rate or MAX_SIM_RATE) + 0.05
+            if not jumped and due and rate_ok:
+                STATE.local_track.append(
+                    sign_point(STATE.session_key, STATE.track_seq, sample)
+                )
+                STATE.track_seq += 1
+                if len(STATE.local_track) > MAX_TRACK_POINTS_LOCAL:
+                    STATE.local_track = compact_track(
+                        STATE.local_track, MAX_TRACK_POINTS_SEND
+                    )
+            STATE._equip_tick += 1
+            do_atc = STATE._equip_tick % 8 == 0
+            STATE._save_tick += 1
+            note_flight_progress(sample)
+            gs_now = float(sample.get("ground_speed") or 0)
+            parked = (
+                bool(sample.get("parking_brake"))
+                and bool(sample.get("on_ground"))
+                and gs_now <= park_gs_limit()
+            )
+            if parked:
+                STATE._park_ticks += 1
+            else:
+                STATE._park_ticks = 0
+            parked_ready = (
+                STATE._park_ticks >= PARK_TICKS_TO_END
+                and not STATE._auto_ending
+                and not STATE._log_ui_open
+                and time.time() >= float(STATE._auto_end_cooldown_until or 0)
+            )
+
+    if sample and sample.get("_jump_suspect"):
+        STATE._teleport_strikes = 0
+        enter_position_mismatch(
+            "jump",
+            raw,
+            sample.get("_ref"),
+            moved_nm=round(float(sample.get("_jump_nm") or 0), 1),
+            allowed_nm=round(float(sample.get("_allowed_nm") or 0), 1),
+            after="live",
+        )
+        return
+    if sample:
+        limit = float(STATE.max_sim_rate or MAX_SIM_RATE)
+        if sample.get("simulation_rate", 1) > limit + 0.05:
+            STATE._simrate_strikes += 1
+            if STATE._simrate_strikes >= SIMRATE_CONFIRM_TICKS:
+                abort_active_flight("simrate")
+                return
+        else:
+            STATE._simrate_strikes = 0
+
+    if STATE._gsx_refuel:
+        refuel_sample = sample
+        if not refuel_sample and raw:
+            try:
+                refuel_sample = make_sample(raw)
+            except Exception:
+                refuel_sample = {
+                    "fuel_total": float(raw.get("fuel_total") or 0),
+                    "ground_speed": float(raw.get("ground_speed") or 0),
+                    "on_ground": bool(raw.get("on_ground", True)),
+                }
+        if refuel_sample:
+            tick_gsx_refuel(refuel_sample)
+
+    integrity_abort = None
+    integrity_ping = None
+    gate_loading = False
+    unreliable = False
+    if sample and STATE.monitoring and STATE.session_key and STATE.active_flight_id:
+        now_t = time.time()
+        started = float(STATE.flight_started_at or now_t)
+        gs_now = float(sample.get("ground_speed") or 0)
+        elapsed = now_t - started
+        unreliable = sim_fuel_unreliable()
+        gate_loading = gs_now < PARKED_IDLE_GS_KT or (
+            elapsed < LOADING_WINDOW_SEC and gs_now < GATE_LOADING_GS_KT
+        )
+        if STATE._gsx_refuel and gs_now <= REFUEL_STATIONARY_GS_KT:
+            gate_loading = True
+        last_i = STATE._integrity_last
+        integ_due = elapsed >= INTEGRITY_GRACE_SEC and (
+            (not last_i)
+            or (now_t - float(last_i.get("t") or 0)) >= INTEGRITY_INTERVAL_SEC
+        )
+        live_due = (now_t - float(STATE._live_last or 0)) >= LIVE_POS_SEC
+        pumping_now = bool(STATE._gsx_refuel) or now_t < float(STATE._refuel_grace_until or 0)
+        if integ_due:
+            if last_i and not gate_loading and not unreliable and not pumping_now:
+                cap = float((STATE.load_info or {}).get("fuel_capacity") or 0)
+                planned = float((STATE.load_info or {}).get("fuel_gal") or 0)
+                found = fuel_weight_tamper_reason(
+                    last_i,
+                    sample,
+                    now_t - float(last_i.get("t") or now_t),
+                    cap,
+                    float(sample.get("simulation_rate") or 1),
+                    allow_ground_uplift=bool(STATE._gsx_refuel),
+                    planned_fuel=planned,
+                )
+                # A single odd reading (EFB sync, pause, unfocused sim) must
+                # not end a flight – only a repeated finding counts.
+                if found:
+                    if STATE._tamper_reason == found:
+                        STATE._tamper_hits += 1
+                    else:
+                        STATE._tamper_reason = found
+                        STATE._tamper_hits = 1
+                    if STATE._tamper_hits >= TAMPER_CONFIRM_HITS:
+                        integrity_abort = found
+                    else:
+                        STATE.log(
+                            t_ui(
+                                "Auffällige Tank-/Gewichtsänderung – wird beim nächsten "
+                                "Check überprüft, der Flug läuft weiter.",
+                                "Unusual fuel/weight change – re-checked on the next pass, "
+                                "the flight continues.",
+                            )
+                        )
+                else:
+                    STATE._tamper_hits = 0
+                    STATE._tamper_reason = ""
+            STATE._integrity_last = {
+                "fuel": _finite(sample.get("fuel_total")),
+                "weight": _finite(sample.get("total_weight_lb")),
+                "t": now_t,
+            }
+        if not integrity_abort and (integ_due or live_due):
+            integrity_ping = {
+                "flight_id": STATE.active_flight_id,
+                "session_key": STATE.session_key,
+                "latitude": sample["latitude"],
+                "longitude": sample["longitude"],
+                "altitude": sample.get("altitude"),
+                "ground_speed": sample.get("ground_speed"),
+                "heading": sample.get("heading"),
+                "fuel_total": sample.get("fuel_total"),
+                "total_weight_lb": sample.get("total_weight_lb"),
+                "on_ground": sample.get("on_ground"),
+                "simulation_rate": sample.get("simulation_rate"),
+                "custom_fuel": unreliable,
+            }
+            if STATE._fuel_report_due:
+                integrity_ping["fuel_report"] = STATE._fuel_report_due
+            STATE._live_last = now_t
+
+    if integrity_abort:
+        abort_active_flight(integrity_abort)
+        return
+    if integrity_ping:
+        try:
+            STATE.api.tracking(integrity_ping)
+            if integrity_ping.get("fuel_report"):
+                STATE._fuel_report_due = None
+        except ServerRejectedError as e:
+            # D8: the server's verdict ends the flight – with its reason, never
+            # translated into a local "teleport".
+            server_ended_flight(str(e))
+            return
+        except RetryableError as e:
+            STATE.log(f"Tracking: Server kurz weg, Flug läuft weiter ({e})")
+        except Exception as e:
+            STATE.log(f"Tracking-Ping: {e}")
+
+    STATE._prefs_tick += 1
+    if STATE.api.token and STATE._prefs_tick % 120 == 0:
+        try:
+            prefs = STATE.api.get_preferences()
+            loc = str(prefs.get("locale") or "").strip().lower()
+            if loc in ("de", "en") and loc != STATE.config.locale:
+                STATE.config.set_locale(loc)
+        except Exception:
+            pass
+
+    # Reconcile: if local monitoring but server has no in_progress flight, clear UI desync
+    if (
+        STATE.monitoring
+        and STATE.active_flight_id
+        and STATE.api.token
+        and STATE._prefs_tick % 45 == 0
+    ):
+        try:
+            active = STATE.api.get_active()
+            if active:
+                STATE._no_server_flight_hits = 0
+            else:
+                # One odd answer (proxy, restart, replica lag) must not throw
+                # away a running flight together with its local track.
+                STATE._no_server_flight_hits += 1
+            if not active and STATE._no_server_flight_hits >= 2:
+                STATE.log(
+                    "Server meldet keinen aktiven Flug – lokale Session wird bereinigt."
+                )
+                _clear_flight_runtime()
+                notify_windows(
+                    t_ui("FlyConomy", "FlyConomy"),
+                    t_ui(
+                        "Kein aktiver Server-Flug mehr – Client-Session bereinigt.",
+                        "No active server flight – client session cleared.",
+                    ),
+                    code="FC-SESSION-CLEARED",
+                    kind="info",
+                )
+                return
+        except Exception:
+            pass
+
+    STATE._icao_tick += 1
+    if STATE._icao_tick % 5 == 0:
+        info = STATE.api.get_nearby(
+            float(raw.get("latitude") or 0),
+            float(raw.get("longitude") or 0),
+        )
+        if info:
+            STATE.current_icao = info.get("icao")
+            STATE.current_airport_name = info.get("name") or ""
+    if STATE.api.token and STATE._icao_tick % 600 == 0:
+        try:
+            STATE.api.refresh_session()
+        except Exception:
+            pass
+    if STATE.api.token and STATE._icao_tick % 4 == 0:
+        try:
+            STATE.api.crew_presence(
+                {
+                    "sim_connected": bool(STATE.sim.connected),
+                    "sim_title": str((STATE.last_sample or {}).get("aircraft_type") or ""),
+                    "icao": STATE.current_icao or "",
+                    "registration": STATE.economy_registration or STATE.registration or "",
+                }
+            )
+        except Exception:
+            pass
+    if (
+        STATE.api.token
+        and not STATE.active_flight_id
+        and STATE._icao_tick % 5 == 0
+        and STATE.restore_state not in ("pending", "unknown")
+    ):
+        try:
+            pending = STATE.api.get_active()
+            if pending and pending.get("id") and pending.get("session_key"):
+                adopt_server_flight(pending)
+        except Exception:
+            pass
+    STATE._mf_tick += 1
+    if STATE.api.token and STATE._mf_tick % 8 == 0:
+        try:
+            mf = STATE.api.get_myflight()
+            ingest_myflight(mf)
+        except Exception:
+            pass
+    if STATE._save_tick and STATE._save_tick % 15 == 0:
+        save_flight_session()
+    if do_atc:
+        if STATE.economy_registration:
+            STATE.sim.set_atc_id(STATE.economy_registration)
+    elif STATE.economy_registration and STATE._icao_tick % 8 == 0:
+        STATE.sim.set_atc_id(STATE.economy_registration)
+    # After start load: never touch fuel/payload again. Only GPS/AP gates if missing.
+    if STATE.monitoring and (not STATE.has_gps or not STATE.has_autopilot):
+        if STATE._equip_tick % 4 == 0:
+            STATE.sim.enforce_equipment_gates(STATE.has_gps, STATE.has_autopilot)
+    if STATE.monitoring:
+        STATE._hours_tick += 1
+        if STATE._hours_tick % 60 == 0:
+            hrs = STATE.api.get_hours_remaining()
+            if hrs is not None:
+                STATE.hours_remaining = hrs
+        if parked_ready and sample:
+            dest = STATE.current_icao
+            if not dest:
+                info = STATE.api.get_nearby(
+                    sample["latitude"], sample["longitude"]
+                )
+                if info:
+                    dest = info.get("icao")
+                    STATE.current_icao = dest
+                    STATE.current_airport_name = info.get("name") or ""
+            if left_origin():
+                from flight_log_ui import start_flight_log_ui
+
+                where = dest or "?"
+                STATE.log(
+                    f"Parkbremse an {where} (Start {STATE.from_icao or '?'}) – Flug wird geloggt…"
+                )
+                try:
+                    # D2: start_flight_log_ui sets _auto_ending only once its
+                    # worker really runs.
+                    start_flight_log_ui()
+                except Exception as e:
+                    STATE._auto_ending = False
+                    STATE._park_ticks = 0
+                    STATE._auto_end_cooldown_until = time.time() + AUTO_END_FAIL_COOLDOWN_SEC
+                    STATE.log(f"Auto-Ende UI: {e}")
+
+
 def monitor_loop() -> None:
     """Sample Sim locally during flight – contact server only on start/end."""
     while True:
         try:
-            drain_gateway_commands()
-            process_ground_queue(allow_fire=not STATE.sim_io_pause)
-            if STATE.sim_io_pause:
-                time.sleep(SAMPLE_SEC)
-                continue
-
-            monitoring = bool(STATE.monitoring and STATE.session_key and STATE.active_flight_id)
-
-            if monitoring and not _msfs_process_running():
-                note_sim_gap()
-                time.sleep(SAMPLE_SEC)
-                continue
-
-            if not STATE.sim.connected:
-                STATE._gsx_cached = False
-                STATE._custom_fuel_cached = False
-                if monitoring:
-                    note_sim_gap()
-                else:
-                    # Without a flight the link used to stay dead until someone
-                    # clicked "connect" – reconnect on our own instead.
-                    now_t = time.time()
-                    if now_t >= STATE._idle_reconnect_at and _msfs_process_running():
-                        STATE._idle_reconnect_at = now_t + IDLE_RECONNECT_SEC
-                        try:
-                            ok, msg = STATE.sim.connect()
-                        except Exception:
-                            ok, msg = False, ""
-                        if ok:
-                            STATE.log(msg)
-                time.sleep(SAMPLE_SEC)
-                continue
-
-            raw = STATE.sim.read()
-            if not raw or (monitoring and not sample_plausible(raw)):
-                if monitoring:
-                    note_sim_gap()
-                time.sleep(SAMPLE_SEC)
-                continue
-
-            if monitoring and STATE._sim_gap_since:
-                resume_after_gap(raw)
-                monitoring = bool(
-                    STATE.monitoring and STATE.session_key and STATE.active_flight_id
-                )
-            slew_now = bool(raw.get("is_slew"))
-            sim_paused_now = bool(raw.get("paused"))
-            if monitoring and slew_now:
-                STATE._slew_strikes += 1
-                if STATE._slew_strikes >= TELEPORT_CONFIRM_TICKS:
-                    abort_active_flight("slew")
-                with STATE.lock:
-                    STATE.last_sample = raw
-                time.sleep(SAMPLE_SEC)
-                continue
-            STATE._slew_strikes = 0
-            if monitoring and sim_paused_now:
-                begin_tracking_pause("sim")
-                STATE._sim_paused = True
-                with STATE.lock:
-                    STATE.last_sample = raw
-                ping_paused_tracking(raw)
-                time.sleep(SAMPLE_SEC)
-                continue
-            if monitoring and STATE._sim_paused:
-                # Active pause / Pause-at-TOD just ended. Raising simrate often
-                # hitch-pauses MSFS; the aircraft keeps flying in sim time, so
-                # a hard 3 nm cut treated honest 16× as a teleport.
-                moved = 0.0
-                prev_pos = STATE._last_pos or STATE._resume_ref or {}
-                try:
-                    moved = nm_between(
-                        float(prev_pos["latitude"]),
-                        float(prev_pos["longitude"]),
-                        float(raw["latitude"]),
-                        float(raw["longitude"]),
-                    )
-                except (KeyError, TypeError, ValueError):
-                    moved = 0.0
-                pause_sec = (
-                    time.time() - float(STATE._pause_started_at)
-                    if STATE._pause_started_at
-                    else 2.0
-                )
-                if prev_pos and prev_pos.get("t"):
-                    pause_sec = max(
-                        pause_sec,
-                        time.time() - float(prev_pos["t"]) / 1000.0,
-                    )
-                note_sim_rate(raw.get("simulation_rate"))
-                allowed = allowed_resume_nm(
-                    pause_sec,
-                    (prev_pos or {}).get("simulation_rate"),
-                    raw.get("simulation_rate"),
-                )
-                if moved > allowed:
-                    abort_active_flight("teleport")
-                    time.sleep(SAMPLE_SEC)
-                    continue
-                end_tracking_pause()
-                STATE.log(
-                    t_ui(
-                        "Pause beendet – Track und Zeit laufen weiter.",
-                        "Pause ended – track and time continue.",
-                    )
-                )
-            if monitoring and STATE._position_mismatch:
-                abort_active_flight("teleport")
-                time.sleep(SAMPLE_SEC)
-                continue
-            try:
-                STATE._gsx_cached = bool(STATE.sim.gsx_running())
-                STATE._custom_fuel_cached = bool(STATE.sim.has_custom_fuel())
-            except Exception:
-                pass
-            sample = None
-            do_atc = False
-            parked_ready = False
-            with STATE.lock:
-                STATE.last_sample = raw
-                if STATE.monitoring and STATE.session_key:
-                    sample = make_sample(raw)
-                    note_sim_rate(sample.get("simulation_rate"))
-                    if sample["simulation_rate"] > MAX_SIM_RATE + 0.05:
-                        # Leave lock before abort (API + popup)
-                        pass
-                    now_ms = int(time.time() * 1000)
-                    prev_pos = STATE._last_pos
-                    jumped = False
-                    if prev_pos:
-                        dt_sec = max(
-                            0.5,
-                            (now_ms - int(prev_pos.get("t") or now_ms)) / 1000.0,
-                        )
-                        jump_nm = nm_between(
-                            float(prev_pos["latitude"]),
-                            float(prev_pos["longitude"]),
-                            sample["latitude"],
-                            sample["longitude"],
-                        )
-                        note_sim_rate(sample.get("simulation_rate"))
-                        max_nm = allowed_move_nm(
-                            dt_sec,
-                            sample.get("simulation_rate"),
-                            prev_pos.get("simulation_rate"),
-                            gs_kt=_finite(sample.get("ground_speed"), 0.0),
-                        )
-                        if jump_nm > max_nm:
-                            # A single stray coordinate is a SimConnect glitch, not a
-                            # teleport: keep the old reference and wait for the next
-                            # sample to confirm the aircraft really moved.
-                            jumped = True
-                            STATE._teleport_strikes += 1
-                            need = 2 if jump_nm > 400 else 3
-                            if STATE._teleport_strikes >= need:
-                                sample = {**sample, "_teleport_abort": True, "_jump_nm": jump_nm}
-                        else:
-                            STATE._teleport_strikes = 0
-                    if not jumped:
-                        STATE._last_pos = {
-                            "latitude": sample["latitude"],
-                            "longitude": sample["longitude"],
-                            "simulation_rate": _finite(sample.get("simulation_rate"), 1.0),
-                            "t": now_ms,
-                        }
-                        STATE._resume_ref = {
-                            "latitude": sample["latitude"],
-                            "longitude": sample["longitude"],
-                            "fuel_total": _finite(sample.get("fuel_total")),
-                            "total_weight_lb": _finite(sample.get("total_weight_lb")),
-                            "simulation_rate": _finite(sample.get("simulation_rate"), 1.0),
-                            "t": now_ms,
-                        }
-                    last = STATE.local_track[-1] if STATE.local_track else None
-                    last_t = int(last.get("t") or 0) if last else 0
-                    elapsed_ms = flight_elapsed_now() * 1000
-                    interval_ms = (
-                        TRACK_INTERVAL_SHORT_MS
-                        if elapsed_ms < TRACK_DENSE_FOR_MS
-                        else TRACK_INTERVAL_MS
-                    )
-                    due = not last or (now_ms - last_t) >= interval_ms
-                    if not sample.get("_teleport_abort") and due:
-                        STATE.local_track.append(
-                            sign_point(STATE.session_key, STATE.track_seq, sample)
-                        )
-                        STATE.track_seq += 1
-                        if len(STATE.local_track) > MAX_TRACK_POINTS_LOCAL:
-                            STATE.local_track = compact_track(
-                                STATE.local_track, MAX_TRACK_POINTS_SEND
-                            )
-                    STATE._equip_tick += 1
-                    do_atc = STATE._equip_tick % 8 == 0
-                    STATE._save_tick += 1
-                    note_flight_progress(sample)
-                    gs_now = float(sample.get("ground_speed") or 0)
-                    parked = (
-                        bool(sample.get("parking_brake"))
-                        and bool(sample.get("on_ground"))
-                        and gs_now <= park_gs_limit()
-                    )
-                    if parked:
-                        STATE._park_ticks += 1
-                    else:
-                        STATE._park_ticks = 0
-                    parked_ready = (
-                        STATE._park_ticks >= PARK_TICKS_TO_END
-                        and not STATE._auto_ending
-                        and time.time() >= float(STATE._auto_end_cooldown_until or 0)
-                    )
-
-            if sample and sample.get("_teleport_abort"):
-                abort_active_flight("teleport")
-                time.sleep(SAMPLE_SEC)
-                continue
-            if sample:
-                if sample.get("simulation_rate", 1) > MAX_SIM_RATE + 0.05:
-                    STATE._simrate_strikes += 1
-                    if STATE._simrate_strikes >= SIMRATE_CONFIRM_TICKS:
-                        abort_active_flight("simrate")
-                        time.sleep(SAMPLE_SEC)
-                        continue
-                else:
-                    STATE._simrate_strikes = 0
-
-            if STATE._gsx_refuel:
-                refuel_sample = sample
-                if not refuel_sample and raw:
-                    try:
-                        refuel_sample = make_sample(raw)
-                    except Exception:
-                        refuel_sample = {
-                            "fuel_total": float(raw.get("fuel_total") or 0),
-                            "ground_speed": float(raw.get("ground_speed") or 0),
-                            "on_ground": bool(raw.get("on_ground", True)),
-                        }
-                if refuel_sample:
-                    tick_gsx_refuel(refuel_sample)
-
-            integrity_abort = None
-            integrity_ping = None
-            gate_loading = False
-            unreliable = False
-            if sample and STATE.monitoring and STATE.session_key and STATE.active_flight_id:
-                now_t = time.time()
-                started = float(STATE.flight_started_at or now_t)
-                gs_now = float(sample.get("ground_speed") or 0)
-                elapsed = now_t - started
-                unreliable = sim_fuel_unreliable()
-                gate_loading = gs_now < PARKED_IDLE_GS_KT or (
-                    elapsed < LOADING_WINDOW_SEC and gs_now < GATE_LOADING_GS_KT
-                )
-                if STATE._gsx_refuel and gs_now <= REFUEL_STATIONARY_GS_KT:
-                    gate_loading = True
-                last_i = STATE._integrity_last
-                integ_due = elapsed >= INTEGRITY_GRACE_SEC and (
-                    (not last_i)
-                    or (now_t - float(last_i.get("t") or 0)) >= INTEGRITY_INTERVAL_SEC
-                )
-                live_due = (now_t - float(STATE._live_last or 0)) >= LIVE_POS_SEC
-                pumping_now = bool(STATE._gsx_refuel) or now_t < float(STATE._refuel_grace_until or 0)
-                if integ_due:
-                    if last_i and not gate_loading and not unreliable and not pumping_now:
-                        cap = float((STATE.load_info or {}).get("fuel_capacity") or 0)
-                        planned = float((STATE.load_info or {}).get("fuel_gal") or 0)
-                        found = fuel_weight_tamper_reason(
-                            last_i,
-                            sample,
-                            now_t - float(last_i.get("t") or now_t),
-                            cap,
-                            float(sample.get("simulation_rate") or 1),
-                            allow_ground_uplift=bool(STATE._gsx_refuel),
-                            planned_fuel=planned,
-                        )
-                        # A single odd reading (EFB sync, pause, unfocused sim) must
-                        # not end a flight – only a repeated finding counts.
-                        if found:
-                            if STATE._tamper_reason == found:
-                                STATE._tamper_hits += 1
-                            else:
-                                STATE._tamper_reason = found
-                                STATE._tamper_hits = 1
-                            if STATE._tamper_hits >= TAMPER_CONFIRM_HITS:
-                                integrity_abort = found
-                            else:
-                                STATE.log(
-                                    t_ui(
-                                        "Auffällige Tank-/Gewichtsänderung – wird beim nächsten "
-                                        "Check überprüft, der Flug läuft weiter.",
-                                        "Unusual fuel/weight change – re-checked on the next pass, "
-                                        "the flight continues.",
-                                    )
-                                )
-                        else:
-                            STATE._tamper_hits = 0
-                            STATE._tamper_reason = ""
-                    STATE._integrity_last = {
-                        "fuel": _finite(sample.get("fuel_total")),
-                        "weight": _finite(sample.get("total_weight_lb")),
-                        "t": now_t,
-                    }
-                if not integrity_abort and (integ_due or live_due):
-                    integrity_ping = {
-                        "flight_id": STATE.active_flight_id,
-                        "session_key": STATE.session_key,
-                        "latitude": sample["latitude"],
-                        "longitude": sample["longitude"],
-                        "altitude": sample.get("altitude"),
-                        "ground_speed": sample.get("ground_speed"),
-                        "heading": sample.get("heading"),
-                        "fuel_total": sample.get("fuel_total"),
-                        "total_weight_lb": sample.get("total_weight_lb"),
-                        "on_ground": sample.get("on_ground"),
-                        "simulation_rate": sample.get("simulation_rate"),
-                        "custom_fuel": unreliable,
-                    }
-                    STATE._live_last = now_t
-
-            if integrity_abort:
-                abort_active_flight(integrity_abort)
-                time.sleep(SAMPLE_SEC)
-                continue
-            if integrity_ping:
-                try:
-                    result = STATE.api.tracking(integrity_ping)
-                    err = str(result.get("error") or "")
-                    if result.get("rejected"):
-                        why = _abort_from_tracking_error(
-                            err, unreliable=unreliable, gate_loading=gate_loading
-                        )
-                        if why:
-                            abort_active_flight(why)
-                            time.sleep(SAMPLE_SEC)
-                            continue
-                        if err:
-                            STATE.log(f"Tracking abgelehnt, Flug läuft weiter: {err}")
-                except RetryableError as e:
-                    STATE.log(f"Tracking: Server kurz weg, Flug läuft weiter ({e})")
-                except RuntimeError as e:
-                    why = _abort_from_tracking_error(
-                        str(e), unreliable=unreliable, gate_loading=gate_loading
-                    )
-                    if why:
-                        abort_active_flight(why)
-                        time.sleep(SAMPLE_SEC)
-                        continue
-                    STATE.log(f"Tracking-Ping: {e}")
-                except Exception as e:
-                    STATE.log(f"Tracking-Ping fehlgeschlagen: {e}")
-
-            STATE._prefs_tick += 1
-            if STATE.api.token and STATE._prefs_tick % 120 == 0:
-                try:
-                    prefs = STATE.api.get_preferences()
-                    loc = str(prefs.get("locale") or "").strip().lower()
-                    if loc in ("de", "en") and loc != STATE.config.locale:
-                        STATE.config.set_locale(loc)
-                except Exception:
-                    pass
-
-            # Reconcile: if local monitoring but server has no in_progress flight, clear UI desync
-            if (
-                STATE.monitoring
-                and STATE.active_flight_id
-                and STATE.api.token
-                and STATE._prefs_tick % 45 == 0
-            ):
-                try:
-                    active = STATE.api.get_active()
-                    if active:
-                        STATE._no_server_flight_hits = 0
-                    else:
-                        # One odd answer (proxy, restart, replica lag) must not throw
-                        # away a running flight together with its local track.
-                        STATE._no_server_flight_hits += 1
-                    if not active and STATE._no_server_flight_hits >= 2:
-                        STATE.log(
-                            "Server meldet keinen aktiven Flug – lokale Session wird bereinigt."
-                        )
-                        _clear_flight_runtime()
-                        notify_windows(
-                            t_ui("FlyConomy", "FlyConomy"),
-                            t_ui(
-                                "Kein aktiver Server-Flug mehr – Client-Session bereinigt.",
-                                "No active server flight – client session cleared.",
-                            ),
-                            code="FC-SESSION-CLEARED",
-                            kind="info",
-                        )
-                        time.sleep(SAMPLE_SEC)
-                        continue
-                except Exception:
-                    pass
-
-            STATE._icao_tick += 1
-            if STATE._icao_tick % 5 == 0:
-                info = STATE.api.get_nearby(
-                    float(raw.get("latitude") or 0),
-                    float(raw.get("longitude") or 0),
-                )
-                if info:
-                    STATE.current_icao = info.get("icao")
-                    STATE.current_airport_name = info.get("name") or ""
-            if STATE.api.token and STATE._icao_tick % 600 == 0:
-                try:
-                    STATE.api.refresh_session()
-                except Exception:
-                    pass
-            if STATE.api.token and STATE._icao_tick % 4 == 0:
-                try:
-                    STATE.api.crew_presence(
-                        {
-                            "sim_connected": bool(STATE.sim.connected),
-                            "sim_title": str((STATE.last_sample or {}).get("aircraft_type") or ""),
-                            "icao": STATE.current_icao or "",
-                            "registration": STATE.economy_registration or STATE.registration or "",
-                        }
-                    )
-                except Exception:
-                    pass
-            if (
-                STATE.api.token
-                and not STATE.active_flight_id
-                and STATE._icao_tick % 5 == 0
-            ):
-                try:
-                    pending = STATE.api.get_active()
-                    if pending and pending.get("id") and pending.get("session_key"):
-                        adopt_server_flight(pending)
-                except Exception:
-                    pass
-            STATE._mf_tick += 1
-            if STATE.api.token and STATE._mf_tick % 8 == 0:
-                try:
-                    mf = STATE.api.get_myflight()
-                    ingest_myflight(mf)
-                except Exception:
-                    pass
-            if STATE._save_tick and STATE._save_tick % 15 == 0:
-                save_flight_session()
-            if do_atc:
-                if STATE.economy_registration:
-                    STATE.sim.set_atc_id(STATE.economy_registration)
-            elif STATE.economy_registration and STATE._icao_tick % 8 == 0:
-                STATE.sim.set_atc_id(STATE.economy_registration)
-            # After start load: never touch fuel/payload again. Only GPS/AP gates if missing.
-            if STATE.monitoring and (not STATE.has_gps or not STATE.has_autopilot):
-                if STATE._equip_tick % 4 == 0:
-                    STATE.sim.enforce_equipment_gates(STATE.has_gps, STATE.has_autopilot)
-            if STATE.monitoring:
-                STATE._hours_tick += 1
-                if STATE._hours_tick % 60 == 0:
-                    hrs = STATE.api.get_hours_remaining()
-                    if hrs is not None:
-                        STATE.hours_remaining = hrs
-                if parked_ready and sample:
-                    dest = STATE.current_icao
-                    if not dest:
-                        info = STATE.api.get_nearby(
-                            sample["latitude"], sample["longitude"]
-                        )
-                        if info:
-                            dest = info.get("icao")
-                            STATE.current_icao = dest
-                            STATE.current_airport_name = info.get("name") or ""
-                    if left_origin():
-                        from flight_log_ui import start_flight_log_ui
-
-                        STATE._auto_ending = True
-                        where = dest or "?"
-                        STATE.log(
-                            f"Parkbremse an {where} (Start {STATE.from_icao or '?'}) – Flug wird geloggt…"
-                        )
-                        try:
-                            start_flight_log_ui()
-                        except Exception as e:
-                            STATE._auto_ending = False
-                            STATE._park_ticks = 0
-                            STATE._auto_end_cooldown_until = time.time() + AUTO_END_FAIL_COOLDOWN_SEC
-                            STATE.log(f"Auto-Ende UI: {e}")
+            monitor_tick()
         except Exception as e:
             print("Monitor:", e)
         time.sleep(SAMPLE_SEC)
 
 
-# ---------------------------------------------------------------------------
-# Security hotfix 2.11.12.1: local bridge only for the MSFS panel, its own pages
-# and local programs – never for websites (taken over unchanged from 2.11.13,
-# review S8 items I3/D11). No flight logic is touched.
-# ---------------------------------------------------------------------------
-
-# Switches (default on). Order: ini [Settings] feature_<name> → versions.json
-# "clientFeatures" (server, system_settings client_features) → default.
-BRIDGE_FEATURE_DEFAULTS = {
-    # Bridge accepts browsers only from the panel (coui://) and its own pages.
-    "bridge_origin_check": True,
-    # Bridge answers only requests addressed to 127.0.0.1/localhost (DNS rebinding).
-    "bridge_host_check": True,
-}
-BRIDGE_SERVER_FEATURES: Dict[str, Any] = {}
-
-
-def feature_enabled(name: str) -> bool:
-    try:
-        raw = STATE.config.config.get("Settings", f"feature_{name}", fallback="").strip().lower()
-    except Exception:
-        raw = ""
-    if raw in ("1", "true", "yes", "on"):
-        return True
-    if raw in ("0", "false", "no", "off"):
-        return False
-    if name in BRIDGE_SERVER_FEATURES:
-        return bool(BRIDGE_SERVER_FEATURES.get(name))
-    return bool(BRIDGE_FEATURE_DEFAULTS.get(name, False))
-
-
 def bridge_origin_verdict(origin: Optional[str], sec_fetch_site: Optional[str]) -> tuple:
-    """(allowed, value for Access-Control-Allow-Origin or None).
+    """(allowed, value for Access-Control-Allow-Origin or None) – I3/D11.
 
     CORS alone does not protect us: a "simple" POST (text/plain, exactly what the
     panel sends) runs on the bridge even if the browser hides the answer. Browsers
     always send an http(s) Origin (or "null") together with Sec-Fetch-Site for a
-    website's request to 127.0.0.1. So:
+    website's request to 127.0.0.1. So (review S8, no bet on the exact string the
+    MSFS engine sends):
       - our own pages (http://127.0.0.1:17474, http://localhost:17474) → yes
       - any non-http scheme (coui://, file://, vfs://, coherent://, …) → yes: no
         website can have such an origin – it is the MSFS panel engine
@@ -5472,9 +7658,9 @@ BRIDGE_HOST_NAMES = ("127.0.0.1", "localhost", "[::1]")
 
 
 def bridge_host_ok(host_header: Optional[str], port: int) -> bool:
-    """DNS rebinding: a foreign name that resolves to 127.0.0.1 sends its own name
-    as Host – and for a same-origin GET neither Origin nor Sec-Fetch-*. Only
-    requests addressed to 127.0.0.1 / localhost are answered. A missing Host
+    """DNS rebinding (review S8): a foreign name that resolves to 127.0.0.1 sends its
+    own name as Host – and for a same-origin GET neither Origin nor Sec-Fetch-*.
+    Only requests addressed to 127.0.0.1 / localhost are answered. A missing Host
     (HTTP/1.0 tools) is tolerated."""
     host = str(host_header or "").strip().lower()
     if not host:
@@ -5493,13 +7679,34 @@ def bridge_host_ok(host_header: Optional[str], port: int) -> bool:
 
 
 # Rejected origins: one log line per origin and 10 minutes, at most 32 different
-# ones – a hostile page must not flood the log or change the panel status text.
+# ones – a hostile page must not flood the log or the panel status (review S8).
 _REJECTED_ORIGINS: Dict[str, float] = {}
 _REJECTED_ORIGINS_MAX = 32
+_BRIDGE_PATHS = (
+    "/", "/status", "/flight-busy", "/sample", "/logs", "/fuel-desk", "/apply-load", "/login",
+    "/connect-sim", "/live-share", "/onboarding", "/start", "/position-choice", "/fuel-mode",
+    "/fuel-action", "/gsx", "/refuel", "/end", "/report-problem", "/cancel", "/hotkey", "/spawn",
+    "/livery-request", "/detach", "/locale", "/myflight", "/open-web-login", "/web-login", "/logout",
+)
 
 
-def _note_rejected_origin(origin: str, sec_fetch_site: str = "") -> None:
+def _bridge_path_class(path: str) -> str:
+    p = str(path or "")
+    if p == "/phone" or p.startswith("/phone/"):
+        return "/phone"
+    return p if p in _BRIDGE_PATHS else "(andere)"
+
+
+def _note_rejected_origin(origin: str, path: str, sec_fetch_site: str = "", why: str = "origin") -> None:
     label = (str(origin or "") or (f"Sec-Fetch-Site {sec_fetch_site}" if sec_fetch_site else "ohne Origin"))[:80]
+    if not getattr(STATE, "_panel_origin_rejected", None):
+        # first rejected request for the problem report (beta: what does MSFS send?)
+        STATE._panel_origin_rejected = {
+            "origin": str(origin or "")[:80],
+            "sec_fetch_site": str(sec_fetch_site or "")[:20],
+            "path": _bridge_path_class(path),
+            "why": why,
+        }
     now = time.time()
     last = _REJECTED_ORIGINS.get(label)
     if last is not None and now - last < 600:
@@ -5507,14 +7714,11 @@ def _note_rejected_origin(origin: str, sec_fetch_site: str = "") -> None:
     if last is None and len(_REJECTED_ORIGINS) >= _REJECTED_ORIGINS_MAX:
         return
     _REJECTED_ORIGINS[label] = now
-    # log line only – STATE.log() would also set the status text panel/app show
-    line = f"[{datetime.now().strftime('%H:%M:%S')}] Bridge: Anfrage von fremder Seite abgelehnt ({label})"
-    STATE.log_lines.append(line)
-    STATE.log_lines = STATE.log_lines[-200:]
+    STATE.log_only(f"Bridge: Anfrage von fremder Seite abgelehnt ({label})")
 
 
 def _public_user(user: Any) -> Optional[dict]:
-    """HTTP /status gets no e-mail, IP, Discord id or token version."""
+    """HTTP /status gets no e-mail, IP, Discord id or token version (review S8)."""
     if not isinstance(user, dict):
         return None
     keep = ("id", "name", "level", "pro_tier", "pro_expires_at", "avatar_url")
@@ -5531,6 +7735,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         """Decide once per request; sets the CORS value for the answer."""
         origin = self.headers.get("Origin")
         sfs = self.headers.get("Sec-Fetch-Site")
+        path = urlparse(self.path).path
         if feature_enabled("bridge_host_check"):
             try:
                 port = int(self.server.server_address[1])
@@ -5538,15 +7743,17 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 port = BRIDGE_PORT
             if not bridge_host_ok(self.headers.get("Host"), port):
                 self._cors_origin = None
-                _note_rejected_origin(f"Host {str(self.headers.get('Host') or '')[:60]}", str(sfs or ""))
+                _note_rejected_origin(f"Host {str(self.headers.get('Host') or '')[:60]}", path, str(sfs or ""), "host")
                 return False
         if not feature_enabled("bridge_origin_check"):
             self._cors_origin = "*"
             return True
         ok, cors = bridge_origin_verdict(origin, sfs)
         self._cors_origin = cors
+        if ok and origin and not getattr(STATE, "_panel_origin_seen", None):
+            STATE._panel_origin_seen = str(origin)[:80]  # shows in diagnostics (beta)
         if not ok:
-            _note_rejected_origin(str(origin or ""), str(sfs or ""))
+            _note_rejected_origin(str(origin or ""), path, str(sfs or ""))
         return ok
 
     def _cors(self) -> None:
@@ -5654,25 +7861,13 @@ class BridgeHandler(BaseHTTPRequestHandler):
                         "last_error": str(e),
                         "last_message": str(getattr(STATE, "last_message", "") or e),
                     }
-                # The Discord JWT never leaves the process over HTTP. The desktop
-                # UI still gets it from snapshot() via pywebview.
+                # I3: the Discord JWT never leaves the process over HTTP. The
+                # desktop UI still gets it from snapshot() via pywebview.
                 snap = {k: v for k, v in snap.items() if k != "access_token"}
                 snap["user"] = _public_user(snap.get("user"))
                 self._json(200, snap)
             elif path == "/flight-busy":
-                fid = STATE.active_flight_id
-                pending = bool(STATE.pending_end)
-                monitoring = bool(STATE.monitoring)
-                self._json(
-                    200,
-                    {
-                        "ok": True,
-                        "busy": bool(fid or monitoring or pending),
-                        "active_flight_id": fid,
-                        "monitoring": monitoring,
-                        "pending_end": pending,
-                    },
-                )
+                self._json(200, flight_busy_status())
             elif path == "/sample":
                 raw = STATE.sim.read() if STATE.sim.connected else None
                 self._json(200, {"ok": True, "sample": raw})
@@ -5684,6 +7879,21 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 except Exception as e:
                     self._json(400, {"ok": False, "error": str(e)})
             elif path == "/apply-load":
+                # D11/I3: GET may change tanks – never during a flight (the old
+                # 1.4.30 panel falls back to GET after a POST timeout).
+                if STATE.monitoring or STATE.active_flight_id:
+                    self._json(
+                        409,
+                        {
+                            "ok": False,
+                            "error": t_ui(
+                                "„Ins EFB laden“ ist während des Flugs gesperrt.",
+                                "“Load to EFB” is locked during the flight.",
+                            ),
+                            "code": "FC-APPLY-LOAD-LOCKED",
+                        },
+                    )
+                    return
                 try:
                     result = action_apply_load()
                     self._json(200, {"ok": True, **result})
@@ -5698,11 +7908,15 @@ class BridgeHandler(BaseHTTPRequestHandler):
             except Exception:
                 pass
 
-    def _note_panel(self) -> None:
+    def _panel_version_of_request(self) -> str:
         qs = parse_qs(urlparse(self.path).query)
         ver = (qs.get("panel") or [""])[0].strip()
         if not ver:
             ver = (self.headers.get("X-FlyConomy-Panel") or "").strip()
+        return ver
+
+    def _note_panel(self) -> None:
+        ver = self._panel_version_of_request()
         if ver:
             note_panel_version(ver)
 
@@ -5716,7 +7930,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
         except (TypeError, ValueError):
             length = -1
         if length < 0 or length > BRIDGE_MAX_BODY:
-            # a negative length used to block a handler thread until the caller closed
+            # review S8: -1 used to block a handler thread until the caller closed
             self._json(400, {"ok": False, "error": "bad Content-Length"})
             return
         raw_body = self.rfile.read(length) if length else b"{}"
@@ -5759,44 +7973,24 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     },
                 )
             elif path == "/start":
-                info = panel_status()
-                if info.get("client_outdated") or info.get("panel_outdated"):
-                    parts = []
-                    if info.get("client_outdated"):
-                        parts.append(
-                            t_ui(
-                                f"Client {CLIENT_VERSION} ist veraltet, aktuell ist {info.get('client_latest')}.",
-                                f"Client {CLIENT_VERSION} is outdated, latest is {info.get('client_latest')}.",
-                            )
-                        )
-                    if info.get("panel_outdated"):
-                        parts.append(
-                            t_ui(
-                                f"MSFS-Panel {info.get('panel_version')} ist veraltet, aktuell ist {info.get('panel_latest')}.",
-                                f"MSFS panel {info.get('panel_version')} is outdated, latest is {info.get('panel_latest')}.",
-                            )
-                        )
-                    msg = " ".join(parts) + " " + t_ui(
-                        "Bitte zuerst unter Downloads aktualisieren.",
-                        "Please update via Downloads first.",
-                    )
-                    notify_windows(
-                        t_ui("FlyConomy – Update nötig", "FlyConomy – Update required"),
-                        msg,
-                        code="FC-OUTDATED",
-                        kind="error",
-                    )
-                    self._json(
-                        409,
-                        {
-                            "ok": False,
-                            "error": msg,
-                            **info,
-                        },
-                    )
-                else:
+                try:
                     result = action_start()
-                    self._json(200, {"ok": True, "result": result})
+                except VersionGateError as e:
+                    self._json(409, {"ok": False, "error": str(e), **(e.info or {})})
+                    return
+                self._json(200, {"ok": True, "result": result})
+            elif path == "/position-choice":
+                choice = str(body.get("choice") or "").strip().lower()
+                if choice not in ("reposition", "continue", "cancel"):
+                    self._json(400, {"ok": False, "error": "choice"})
+                elif not STATE._position_mismatch:
+                    self._json(409, {"ok": False, "error": t_ui("Keine offene Frage", "Nothing to choose")})
+                elif choice == "cancel":
+                    # review S8: cancelling goes through the same confirmation as /cancel
+                    self._json(200, bridge_cancel(body, self._panel_version_of_request()))
+                else:
+                    STATE._mismatch_choice = choice
+                    self._json(200, {"ok": True, "choice": choice})
             elif path == "/fuel-mode":
                 mode = str(body.get("mode") or body.get("fuel_mode") or "auto")
                 STATE.config.set_fuel_mode(mode)
@@ -5865,8 +8059,7 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     },
                 )
             elif path == "/cancel":
-                result = action_cancel()
-                self._json(200, {"ok": True, "result": result})
+                self._json(200, bridge_cancel(body, self._panel_version_of_request()))
             elif path == "/hotkey":
                 result = action_hotkey(body)
                 self._json(200, {"ok": True, **result})
@@ -5920,6 +8113,240 @@ class BridgeHandler(BaseHTTPRequestHandler):
 
     def log_message(self, fmt: str, *args: Any) -> None:
         return
+
+
+def flight_busy_status() -> dict:
+    """For the updater: never replace the client while anything flight-related is
+    open – also a session file the server has not confirmed yet (D1.4)."""
+    fid = STATE.active_flight_id
+    pending_end = bool(STATE.pending_end) or file_or_bak_exists(PENDING_END_PATH)
+    pending_start = bool(STATE.pending_start) or file_or_bak_exists(PENDING_START_PATH)
+    session = file_or_bak_exists(FLIGHT_SESSION_PATH)
+    monitoring = bool(STATE.monitoring)
+    return {
+        "ok": True,
+        "busy": bool(fid or monitoring or pending_end or pending_start or session),
+        "active_flight_id": fid,
+        "monitoring": monitoring,
+        "pending_end": pending_end,
+        "pending_start": pending_start,
+        "session_file": session,
+        "restore_state": STATE.restore_state,
+    }
+
+
+def flight_may_be_open() -> bool:
+    """Anything flight-related in memory or on disk – also while the restore after a
+    restart has not decided yet (review S8: then memory alone says "no flight")."""
+    if STATE.active_flight_id or STATE.monitoring:
+        return True
+    if STATE.restore_state in ("pending", "unknown"):
+        return True
+    return bool(flight_busy_status().get("busy"))
+
+
+def bridge_cancel(body: dict, panel_version: str) -> dict:
+    """/cancel over the bridge (D11). Panel 1.4.31+ already asked twice; any other
+    caller (old panel, phone page) gets a Windows question first."""
+    if not flight_may_be_open():
+        return {"ok": True, "result": action_cancel()}
+    confirmed = str((body or {}).get("confirm") or "") == "two-tap" and version_tuple(
+        panel_version
+    ) >= version_tuple(PANEL_TWO_TAP_CANCEL)
+    if confirmed:
+        return {"ok": True, "result": action_cancel()}
+    ask_cancel_confirmation()
+    return {
+        "ok": True,
+        "pending_confirm": True,
+        "message": t_ui(
+            "Bitte im FlyConomy-Fenster bestätigen – der Flug läuft weiter, bis du „Ja“ drückst.",
+            "Please confirm in the FlyConomy window – the flight continues until you press “Yes”.",
+        ),
+    }
+
+
+def _open_flight_id() -> Any:
+    if STATE.active_flight_id is not None:
+        return STATE.active_flight_id
+    data = read_flight_session_file()
+    return (data or {}).get("flight_id")
+
+
+def ask_cancel_confirmation() -> None:
+    fid = _open_flight_id()
+
+    def on_choice(key: str) -> None:
+        if key != "cancel":
+            STATE.log(t_ui("Abbruch nicht bestätigt – Flug läuft weiter.", "Cancel not confirmed – flight continues."))
+            return
+        cur = _open_flight_id()
+        if fid is not None and cur is not None and str(cur) != str(fid):
+            return  # a different flight by now – never cancel that one
+
+        def run() -> None:
+            try:
+                action_cancel()
+            except Exception as e:
+                STATE.log(f"Abbruch: {e}")
+
+        threading.Thread(target=run, daemon=True).start()
+
+    msg = t_ui(
+        "Das Panel möchte den laufenden Flug abbrechen. Ein abgebrochener Flug wird nicht bezahlt.",
+        "The panel wants to cancel the running flight. A cancelled flight is not paid.",
+    )
+    try:
+        from client_notice import ask_choice
+
+        ask_choice(
+            t_ui("FlyConomy – Flug abbrechen?", "FlyConomy – Cancel flight?"),
+            msg,
+            [
+                ("keep", t_ui("Nein, weiterfliegen", "No, keep flying"), "primary"),
+                ("cancel", t_ui("Ja, Flug abbrechen", "Yes, cancel flight"), "danger"),
+            ],
+            on_choice,
+            code="FC-CANCEL-CONFIRM",
+        )
+    except Exception as e:
+        STATE.log(f"Abbruch-Rückfrage: {e}")
+
+
+# ---------------------------------------------------------------------------
+# D1: after a client/PC restart, look for the open flight in the background.
+# ---------------------------------------------------------------------------
+
+
+_RESTORE_LOCK = threading.Lock()
+
+
+def restore_open_flight() -> str:
+    """'restored' | 'adopted' | 'server_only' | 'stale_removed' | 'none' | 'unknown' | 'busy' | 'retry'.
+
+    'unknown' (network, 5xx, 401) keeps the session file untouched – unlike the
+    old bootstrap, which deleted it whenever the server was briefly away."""
+    with _RESTORE_LOCK:
+        return _restore_open_flight()
+
+
+def _restore_open_flight() -> str:
+    if STATE.monitoring and STATE.session_key:
+        return "busy"
+    if not ensure_api_token():
+        return "unknown"
+    data = read_flight_session_file()
+    try:
+        active = STATE.api.get_active()
+    except Exception:
+        return "unknown"
+    # Review S8: apply the answer only while no start and no flight end runs. A
+    # stored end sent by the retry loop at the same moment may book this very
+    # flight – then the session must not come back to life ("retry" = try again
+    # in a moment, the session file stays untouched).
+    if not _START_LOCK.acquire(blocking=False):
+        return "retry"
+    try:
+        if not _END_LOCK.acquire(blocking=False):
+            return "retry"
+        try:
+            return _apply_restore(data, active)
+        finally:
+            _END_LOCK.release()
+    finally:
+        _START_LOCK.release()
+
+
+def _apply_restore(data: Optional[dict], active: Optional[dict]) -> str:
+    if STATE.monitoring and STATE.session_key:
+        return "busy"  # a start or adopt armed a flight while we asked the server
+    if data:
+        # re-read: a flush may have removed it (flight logged) while we asked
+        fresh = read_flight_session_file()
+        if not fresh or str(fresh.get("session_key")) != str(data.get("session_key")):
+            data = fresh
+    if data and session_ended(data.get("session_key")):
+        remove_file_and_bak(FLIGHT_SESSION_PATH)
+        data = None
+    if active and active.get("id") and flight_ended_locally(active.get("id")):
+        active = None  # logged/cancelled here a moment ago – the GET answer was older
+    if active and active.get("id"):
+        if data and str(data.get("flight_id")) == str(active.get("id")):
+            apply_flight_session(data, restored=True)
+            if not STATE.flight_started_at:
+                STATE.flight_started_at = _parse_started_at(active.get("started_at"))
+            STATE.log(
+                t_ui(
+                    "Offener Flug wiederhergestellt – die Aufzeichnung läuft weiter, sobald der Sim "
+                    "wieder Daten liefert. Nichts wird automatisch abgebrochen.",
+                    "Open flight restored – recording continues as soon as the sim reports data. "
+                    "Nothing is cancelled automatically.",
+                )
+            )
+            STATE.set_ui_status("Flug wiederhergestellt", "Flight restored")
+            _push_presence()
+            return "restored"
+        if data:
+            STATE.log(
+                t_ui(
+                    "Lokale Flug-Sitzung gehört zu einem anderen Flug – entfernt.",
+                    "Local flight session belongs to another flight – removed.",
+                )
+            )
+            remove_file_and_bak(FLIGHT_SESSION_PATH)
+        if active.get("session_key"):
+            adopt_server_flight(active)
+            return "adopted"
+        if STATE.active_flight_id is not None and str(STATE.active_flight_id) != str(active.get("id")):
+            return "busy"
+        STATE.active_flight_id = active.get("id")
+        STATE.monitoring = False
+        msg = t_ui(
+            "Auf dem Server läuft ein Flug ohne lokale Sitzung. „Flug starten“ übernimmt ihn, "
+            "wenn die Sitzung noch auf diesem PC liegt – sonst „Abbrechen“.",
+            "The server has a running flight without a local session. “Start flight” takes it "
+            "over if the session is still on this PC – otherwise “Cancel”.",
+        )
+        STATE.log(msg)
+        STATE.set_ui_status(msg, msg)
+        return "server_only"
+    if data:
+        # The server confirmed: no flight. A stored flight end (if any) stays queued.
+        remove_file_and_bak(FLIGHT_SESSION_PATH)
+        STATE.log(
+            t_ui(
+                "Alte Flug-Sitzung ohne Server-Flug entfernt.",
+                "Old flight session without a server flight removed.",
+            )
+        )
+        return "stale_removed"
+    return "none"
+
+
+def restore_worker() -> None:
+    """Runs once the token is known; retries while the answer is 'unknown'."""
+    delay = 10.0
+    STATE.restore_state = "pending"
+    while True:
+        if not ensure_api_token():
+            time.sleep(2.0)
+            continue
+        try:
+            outcome = restore_open_flight()
+        except Exception as e:
+            STATE.log(f"Wiederherstellung: {e}")
+            outcome = "unknown"
+        if outcome == "retry":
+            # a start or flight end is running right now – look again shortly
+            STATE.restore_state = "unknown"
+            time.sleep(2.0)
+            continue
+        if outcome != "unknown":
+            STATE.restore_state = outcome
+            return
+        STATE.restore_state = "unknown"
+        time.sleep(delay)
+        delay = min(60.0, delay * 1.5)
 
 
 def action_detach_phone() -> dict:
@@ -6001,42 +8428,13 @@ class DesktopApi:
             ok, msg = STATE.api.login(None, STATE.config.access_token)
             STATE.log(msg if ok else f"Auto-Login: {msg}")
         if STATE.api.token:
-            try:
-                active = STATE.api.get_active()
-            except Exception:
-                active = None
-            restored = load_flight_session()
-            if active and active.get("id"):
-                STATE.active_flight_id = active.get("id")
-                if restored and str(STATE.active_flight_id) == str(active.get("id")):
-                    if not STATE.flight_started_at:
-                        STATE.flight_started_at = _parse_started_at(active.get("started_at"))
-                    if not STATE.aircraft_label:
-                        apply_flight_meta({"flight": active, "aircraft": active}, STATE.flight_started_at)
-                    STATE.monitoring = True
-                    STATE.log(
-                        "Offener Flug wiederhergestellt – Timer läuft weiter. "
-                        "Beenden per Knopf oder Parkbremse an anderem ICAO."
-                    )
-                elif restored:
-                    started = _parse_started_at(active.get("started_at"))
-                    _clear_flight_runtime()
-                    STATE.active_flight_id = active.get("id")
-                    apply_flight_meta({"flight": active, "aircraft": active}, started)
-                    STATE.monitoring = False
-                    STATE.log(
-                        "Offener Flug auf dem Server – Handbremse am Ziel oder „Abbrechen“."
-                    )
-                else:
-                    started = _parse_started_at(active.get("started_at"))
-                    apply_flight_meta({"flight": active, "aircraft": active}, started)
-                    STATE.monitoring = False
-                    STATE.log(
-                        "Offener Flug auf dem Server ohne lokale Session – "
-                        "„Abbrechen“ oder Client-Session fehlt."
-                    )
-            elif restored:
-                _clear_flight_runtime()
+            # D1: same restore as the MiniClient – a network error keeps the
+            # session file (the old code deleted it when the server was away).
+            if STATE.restore_state in ("idle", "unknown"):
+                try:
+                    STATE.restore_state = restore_open_flight()
+                except Exception as e:
+                    STATE.log(f"Wiederherstellung: {e}")
             try:
                 hrs = STATE.api.get_hours_remaining()
                 if hrs is not None:
@@ -6081,14 +8479,6 @@ class DesktopApi:
 
     def start_flight(self) -> dict:
         try:
-            info = panel_status()
-            if info.get("client_outdated") or info.get("panel_outdated"):
-                raise RuntimeError(
-                    t_ui(
-                        "Bitte zuerst Client/Panel unter flyconomy.de/downloads aktualisieren.",
-                        "Please update client/panel at flyconomy.de/downloads first.",
-                    )
-                )
             STATE.log("Flugstart…")
             STATE.last_error = None
             result = action_start()
@@ -6474,6 +8864,9 @@ def main() -> None:
     STATE.pending_start = load_pending_start()
     if STATE.pending_start:
         STATE.log("Ein Flugstart liegt in der Warteschlange – wird nachgeholt.")
+    reset_queue_timers()
+    # D1: both clients look for the open flight as soon as the token is known.
+    threading.Thread(target=restore_worker, daemon=True, name="fc-restore").start()
     mini = any(a in ("--mini", "-m", "mini") for a in sys.argv[1:])
     if mini:
         STATE.log(f"FlyConomy MiniClient {CLIENT_VERSION} gestartet")

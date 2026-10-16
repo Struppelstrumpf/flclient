@@ -642,6 +642,7 @@ ingame-ui#FlyConomyPanel {
 }
 .cta.red { background: var(--gx-red); }
 .cta.green { background: #26a269; }
+.cta.amber { background: #b7791f; }
 .cta.busy { background: var(--gx-blue); opacity: 0.92; }
 .cta:disabled { opacity: 0.4; cursor: default; }
 .cta:active, .cta.is-press { opacity: 0.9; transform: scale(0.98); }
@@ -774,4 +775,31 @@ ingame-ui#FlyConomyPanel {
 #keysVol {
   width: 100%;
   margin: 4px 0 8px;
+}
+
+/* 1.4.31: armed cancel tile (two taps) and the position question after a restart */
+.tile.armed {
+  background: #5a1d22;
+  box-shadow: inset 0 0 0 2px var(--gx-red);
+}
+.gx-mismatch {
+  display: flex;
+  gap: 8px;
+  margin: 8px 14px 0;
+  flex-shrink: 0;
+}
+.gx-mm-btn {
+  flex: 1 1 0;
+  border: 0;
+  border-radius: 10px;
+  padding: 9px 8px;
+  font-size: 12px;
+  font-weight: 800;
+  font-family: inherit;
+  color: #fff;
+  background: #1a73e8;
+  cursor: pointer;
+}
+.gx-mm-btn.alt {
+  background: #2b3a4f;
 }

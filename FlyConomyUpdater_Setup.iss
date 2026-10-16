@@ -1,10 +1,10 @@
 ; FlyConomy Updater – Installer (Inno Setup 6)
 #define MyAppName "FlyConomy Updater"
-#define MyAppVersion "1.0.5"
+#define MyAppVersion "1.0.6"
 #define MyAppPublisher "FlyConomy"
 #define MyAppURL "https://flyconomy.de"
-; Source of exactly this setup (AGPL 6 d): the tag of the client release it ships with
-#define MySourceURL "https://github.com/Struppelstrumpf/flclient/tree/v2.11.12.1"
+; Source of exactly this setup (AGPL 6 d): the tag of the client release it ships with (update at release)
+#define MySourceURL "https://github.com/Struppelstrumpf/flclient/tree/v2.11.13"
 #define MyAppExeName "FlyConomyUpdater.exe"
 
 [Setup]

@@ -6,8 +6,8 @@ VSVersionInfo(
   ffi=FixedFileInfo(
     # filevers and prodvers should be always a tuple with four items: (1, 2, 3, 4)
     # Set not needed items to zero 0.
-    filevers=(2, 11, 12, 1),
-    prodvers=(2, 11, 12, 1),
+    filevers=(2, 11, 13, 0),
+    prodvers=(2, 11, 13, 0),
     # Contains a bitmask that specifies the valid bits 'flags'r
     mask=0x3f,
     # Contains a bitmask that specifies the Boolean attributes of the file.
@@ -31,12 +31,12 @@ VSVersionInfo(
         '040904B0',
         [StringStruct('CompanyName', 'FlyConomy'),
         StringStruct('FileDescription', 'FlyConomy MiniClient Bridge'),
-        StringStruct('FileVersion', '2.11.12.1'),
+        StringStruct('FileVersion', '2.11.13'),
         StringStruct('InternalName', 'FlyConomyMiniClient'),
         StringStruct('LegalCopyright', 'FlyConomy'),
         StringStruct('OriginalFilename', 'FlyConomyMiniClient.exe'),
         StringStruct('ProductName', 'FlyConomy MiniClient'),
-        StringStruct('ProductVersion', '2.11.12.1')])
+        StringStruct('ProductVersion', '2.11.13')])
       ]), 
     VarFileInfo([VarStruct('Translation', [1033, 1200])])
   ]

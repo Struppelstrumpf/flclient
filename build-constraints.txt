@@ -1,8 +1,7 @@
 # Paketversionen der Build-Umgebung, mit der die ausgelieferten Programme
-# (MiniClient 2.11.12 und 2.11.12.1, Updater 1.0.5, Browser inApp 1.0.1) gebaut wurden.
+# (MiniClient 2.11.12, Updater 1.0.5, Browser inApp 1.0.1) gebaut wurden.
 # Package versions of the build environment used for the distributed programs.
-# Python: CPython 3.14.0 (64 bit), Windows. Installer: Inno Setup 6.7.0 (2.11.12),
-# 6.7.3 (Setups MiniClient 2.11.12.1 und neu verpacktes Updater-Setup 1.0.5).
+# Python: CPython 3.14.0 (64 bit), Windows. Installer: Inno Setup 6.7.0.
 #
 #   python -m pip install -r requirements.txt pyinstaller -c build-constraints.txt
 #

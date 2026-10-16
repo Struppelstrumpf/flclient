@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""FlyConomy Updater – keeps MiniClient, MSFS panel and full client current."""
+"""FlyConomy Updater – keeps MiniClient and MSFS panel current.
+
+The full client is no longer offered (owner decision Q19, 2026-10-14): it is
+neither installed nor updated any more; an existing installation keeps
+working and can still be uninstalled here.
+"""
 from __future__ import annotations
 
 import ctypes
@@ -26,7 +31,7 @@ except ImportError:
 
 SITE_URL = "https://flyconomy.de"
 VERSIONS_URL = f"{SITE_URL}/api/live/versions.json"
-UPDATER_VERSION = "1.0.5"
+UPDATER_VERSION = "1.0.6"
 
 try:
     from flyconomy_webapp import desktop_shortcut_path, ensure_desktop_shortcut
@@ -363,6 +368,8 @@ class Updater:
             "fullClientUrl": "",
             "updaterUrl": "",
         }
+        # Q19: retired unless the server explicitly offers it again.
+        self.full_retired = True
         self.window: Any = None
         self._stop = threading.Event()
         self._wait_flight = False
@@ -426,8 +433,11 @@ class Updater:
                 "installed": FULL_EXE.is_file(),
                 "running": process_running("FlyConomyClient.exe"),
                 "version": full_ver,
-                "latest": self.latest.get("fullClient") or self.latest.get("client") or "",
-                "outdated": version_less(full_ver, self.latest.get("fullClient") or self.latest.get("client")),
+                "retired": self.full_retired,
+                "latest": "" if self.full_retired else (self.latest.get("fullClient") or ""),
+                "outdated": False
+                if self.full_retired
+                else version_less(full_ver, self.latest.get("fullClient")),
             },
             "self": {
                 "version": updater_ver,
@@ -443,7 +453,9 @@ class Updater:
         data = r.json() or {}
         self.latest["client"] = str(data.get("client") or "").strip()
         self.latest["panel"] = str(data.get("panel") or data.get("latest") or "").strip()
-        self.latest["fullClient"] = str(data.get("fullClient") or data.get("client") or "").strip()
+        self.latest["fullClient"] = str(data.get("fullClient") or "").strip()
+        # Q19: only an explicit "fullClientDeprecated": false offers it again.
+        self.full_retired = data.get("fullClientDeprecated") is not False
         self.latest["updater"] = str(data.get("updater") or UPDATER_VERSION).strip()
         self.latest["clientUrl"] = str(data.get("clientUrl") or f"{SITE_URL}/downloads/FlyConomyMiniClient_Setup.exe")
         self.latest["panelUrl"] = str(data.get("panelUrl") or f"{SITE_URL}/downloads/FlyConomy-MSFS-Panel.zip")
@@ -528,6 +540,11 @@ class Updater:
         self.log("MiniClient gestartet.")
 
     def install_full(self) -> None:
+        if self.full_retired:
+            raise RuntimeError(
+                "Der volle Client wird nicht mehr angeboten. Bitte den MiniClient nutzen – "
+                "eine vorhandene Installation läuft weiter."
+            )
         url = self.latest["fullClientUrl"]
         setup = Path(tempfile.gettempdir()) / "FlyConomyClient_Setup.exe"
         was_running = process_running("FlyConomyClient.exe")
@@ -604,9 +621,9 @@ class Updater:
         if version_less(panel_ver, self.latest.get("panel")):
             self.busy_label = "Panel"
             self.install_panel()
-        if include_full and FULL_EXE.is_file():
+        if include_full and not self.full_retired and FULL_EXE.is_file():
             full_ver = file_version(FULL_EXE)
-            latest_full = self.latest.get("fullClient") or self.latest.get("client")
+            latest_full = self.latest.get("fullClient")
             if version_less(full_ver, latest_full):
                 self.busy_label = "Client"
                 self.install_full()

@@ -182,6 +182,7 @@ class ClientGateway:
             raise RuntimeError("gateway accept mismatch")
         self._sock = sock
         self._leftover = rest
+        self._frag = None
         token = self.token_provider() if self.token_provider else ""
         device = self.device_id_provider() if self.device_id_provider else ""
         version = self.version_provider() if self.version_provider else ""
@@ -257,36 +258,93 @@ class ClientGateway:
         with self._send_lock:
             sock.sendall(bytes(header) + _mask(payload))
 
-    def _read_exact(self, n: int) -> bytes:
+    def _fill(self, n: int) -> None:
+        """Make sure n bytes are buffered. A socket timeout leaves everything that
+        was read in the buffer – the old _read_exact dropped it and the next frame
+        was read from the middle of the previous one (desync → reconnect)."""
         sock = self._sock
         if not sock:
             raise RuntimeError("not connected")
         buf = getattr(self, "_leftover", b"")
-        self._leftover = b""
         while len(buf) < n:
-            chunk = sock.recv(max(n - len(buf), 4096))
+            try:
+                chunk = sock.recv(max(n - len(buf), 4096))
+            except socket.timeout:
+                self._leftover = buf
+                raise
             if not chunk:
+                self._leftover = buf
                 raise RuntimeError("gateway closed")
             buf += chunk
+        self._leftover = buf
+
+    def _read_exact(self, n: int) -> bytes:
+        self._fill(n)
+        buf = self._leftover
         out, self._leftover = buf[:n], buf[n:]
         return out
 
-    def _read_frame(self) -> Optional[tuple[int, bytes]]:
-        hdr = self._read_exact(2)
-        opcode = hdr[0] & 0x0F
-        masked = bool(hdr[1] & 0x80)
-        ln = hdr[1] & 0x7F
+    def _parse_header(self) -> tuple[int, int, int, bool, int]:
+        """(header length, payload length, opcode, masked, fin) of the buffered frame."""
+        self._fill(2)
+        b0, b1 = self._leftover[0], self._leftover[1]
+        fin = (b0 >> 7) & 1
+        opcode = b0 & 0x0F
+        masked = bool(b1 & 0x80)
+        ln = b1 & 0x7F
+        hlen = 2
         if ln == 126:
-            ln = struct.unpack("!H", self._read_exact(2))[0]
+            self._fill(4)
+            ln = struct.unpack("!H", self._leftover[2:4])[0]
+            hlen = 4
         elif ln == 127:
-            ln = struct.unpack("!Q", self._read_exact(8))[0]
+            self._fill(10)
+            ln = struct.unpack("!Q", self._leftover[2:10])[0]
+            hlen = 10
         if ln > MAX_FRAME:
             raise RuntimeError("gateway frame too large")
-        mask = self._read_exact(4) if masked else b""
-        payload = self._read_exact(ln) if ln else b""
+        if masked:
+            hlen += 4
+        return hlen, ln, opcode, masked, fin
+
+    def _read_one_frame(self) -> tuple[int, bytes, int]:
+        """One complete frame or socket.timeout – nothing is consumed until the
+        whole frame is in the buffer."""
+        hlen, ln, opcode, masked, fin = self._parse_header()
+        self._fill(hlen + ln)
+        buf = self._leftover
+        mask = buf[hlen - 4 : hlen] if masked else b""
+        payload = buf[hlen : hlen + ln]
+        self._leftover = buf[hlen + ln :]
         if masked:
             payload = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
-        return opcode, payload
+        return opcode, payload, fin
+
+    def _read_frame(self) -> Optional[tuple[int, bytes]]:
+        """Next message; continuation frames (FIN=0) are joined."""
+        while True:
+            opcode, payload, fin = self._read_one_frame()
+            if opcode >= 0x8:
+                return opcode, payload  # control frames are never fragmented
+            if opcode == 0x0:
+                parts = getattr(self, "_frag", None)
+                if parts is None:
+                    continue  # stray continuation without a start – ignore it
+                op0, data = parts
+                data += payload
+                if len(data) > MAX_FRAME * 4:
+                    self._frag = None
+                    raise RuntimeError("gateway message too large")
+                if fin:
+                    self._frag = None
+                    return op0, data
+                self._frag = (op0, data)
+                continue
+            if not fin:
+                self._frag = (opcode, payload)
+                continue
+            self._frag = None
+            return opcode, payload
 
     def _close(self) -> None:
         self._connected = False

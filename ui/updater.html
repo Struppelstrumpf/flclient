@@ -183,12 +183,18 @@
       document.getElementById('panelMeta').textContent = panel.installed
         ? `Installiert ${panel.version || '–'} · aktuell ${panel.latest || '–'}`
         : `Nicht installiert · aktuell ${panel.latest || '–'} (wird automatisch eingerichtet)`
-      document.getElementById('fullMeta').textContent = full.installed
-        ? `Installiert ${full.version || '–'} · aktuell ${full.latest || '–'}`
-        : `Nicht installiert · aktuell ${full.latest || '–'} · nur per Button`
+      document.getElementById('fullMeta').textContent = full.retired
+        ? (full.installed
+          ? `Installiert ${full.version || '–'} · wird nicht mehr angeboten. Läuft weiter – bitte auf den MiniClient wechseln.`
+          : 'Wird nicht mehr angeboten – bitte den MiniClient nutzen.')
+        : full.installed
+          ? `Installiert ${full.version || '–'} · aktuell ${full.latest || '–'}`
+          : `Nicht installiert · aktuell ${full.latest || '–'} · nur per Button`
+      document.getElementById('btnFullIn').style.display = full.retired ? 'none' : ''
+      document.getElementById('btnFullUn').style.display = full.retired && !full.installed ? 'none' : ''
       pill(document.getElementById('miniPill'), mini.installed ? (s.waitFlight && mini.outdated ? 'Wartet' : (mini.outdated ? 'Update' : 'OK')) : 'Auto', mini.installed ? (s.waitFlight && mini.outdated ? 'warn' : (mini.outdated ? 'warn' : 'ok')) : 'warn')
       pill(document.getElementById('panelPill'), panel.installed ? (panel.outdated ? 'Update' : 'OK') : 'Auto', panel.installed ? (panel.outdated ? 'warn' : 'ok') : 'warn')
-      pill(document.getElementById('fullPill'), full.installed ? (full.outdated ? 'Update' : 'OK') : 'Manuell', full.installed ? (full.outdated ? 'warn' : 'ok') : 'off')
+      pill(document.getElementById('fullPill'), full.retired ? 'Eingestellt' : (full.installed ? (full.outdated ? 'Update' : 'OK') : 'Manuell'), full.retired ? 'off' : (full.installed ? (full.outdated ? 'warn' : 'ok') : 'off'))
       pill(document.getElementById('selfPill'), self.outdated ? 'Update' : 'Auto', self.outdated ? 'warn' : 'ok')
       document.getElementById('log').textContent = (s.logs || []).join('\n')
       document.getElementById('log').scrollTop = 9999

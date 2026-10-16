@@ -38,7 +38,7 @@
 
               <header class="gx-head">
                 <div class="gx-head-copy">
-                    <div class="gx-title">FlyConomy <span id="headVer" class="gx-ver">v1.4.30</span></div>
+                    <div class="gx-title">FlyConomy <span id="headVer" class="gx-ver">v1.4.31</span></div>
                   <div class="gx-sub" id="headSub">Bridge verbindet...</div>
                 </div>
                 <button id="btnLog" class="gx-ico" type="button">Log</button>
@@ -54,15 +54,19 @@
               </div>
 
               <div id="alertBox" class="gx-alert hidden"></div>
+              <div id="mismatchBar" class="gx-mismatch hidden">
+                <button id="btnPosBack" class="gx-mm-btn" type="button">Zur letzten Position</button>
+                <button id="btnPosHere" class="gx-mm-btn alt" type="button">Hier weiterfliegen</button>
+              </div>
 
               <div class="gx-body">
                 <section id="viewHome" class="view">
                   <div class="tile-grid">
                     <div class="tile-cell"><button class="tile" data-go="gsx" data-key="1" type="button"><b class="n">1</b><span class="tile-ico ico-gsx"></span><span class="lab">Ground / GSX</span></button></div>
                     <div class="tile-cell"><button class="tile" data-go="fuel" data-key="2" type="button"><b class="n">2</b><span class="tile-ico ico-fuel"></span><span class="lab">Tanken</span></button></div>
-                    <div class="tile-cell"><button class="tile" id="btnLoadEfb" data-key="3" type="button"><b class="n">3</b><span class="tile-ico ico-efb"></span><span class="lab">Ins EFB laden</span></button></div>
+                    <div class="tile-cell"><button class="tile" id="btnLoadEfb" type="button"><span class="tile-ico ico-efb"></span><span class="lab">Ins EFB laden</span></button></div>
                     <div class="tile-cell"><button class="tile gsx-act" data-gsx="board" data-key="4" type="button"><b class="n">4</b><span class="tile-ico ico-board"></span><span class="lab">Boarding</span></button></div>
-                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="pushback" data-key="5" type="button"><b class="n">5</b><span class="tile-ico ico-pushback"></span><span class="lab">Pushback</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="pushback" type="button"><span class="tile-ico ico-pushback"></span><span class="lab">Pushback</span></button></div>
                     <div class="tile-cell"><button class="tile gsx-act" data-gsx="jetway" data-key="6" type="button"><b class="n">6</b><span class="tile-ico ico-jetway"></span><span class="lab">Jetway</span></button></div>
                     <div class="tile-cell"><button class="tile" data-go="ramp" data-key="7" type="button"><b class="n">7</b><span class="tile-ico ico-ramp"></span><span class="lab">Vorfeld</span></button></div>
                     <div class="tile-cell"><button class="tile" data-go="more" data-key="8" type="button"><b class="n">8</b><span class="tile-ico ico-more"></span><span class="lab">Mehr</span></button></div>
@@ -76,7 +80,7 @@
                     <div class="tile-cell"><button class="tile gsx-act" data-gsx="catering" data-key="2" type="button"><b class="n">2</b><span class="tile-ico ico-catering"></span><span class="lab">Catering</span></button></div>
                     <div class="tile-cell"><button class="tile gsx-act" data-gsx="call_truck" data-key="3" type="button"><b class="n">3</b><span class="tile-ico ico-fuel"></span><span class="lab">Tankwagen</span></button></div>
                     <div class="tile-cell"><button class="tile gsx-act" data-gsx="board" data-key="4" type="button"><b class="n">4</b><span class="tile-ico ico-board"></span><span class="lab">Boarding</span></button></div>
-                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="pushback" data-key="5" type="button"><b class="n">5</b><span class="tile-ico ico-pushback"></span><span class="lab">Pushback</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="pushback" type="button"><span class="tile-ico ico-pushback"></span><span class="lab">Pushback</span></button></div>
                     <div class="tile-cell"><button class="tile gsx-act" data-gsx="jetway" data-key="6" type="button"><b class="n">6</b><span class="tile-ico ico-jetway"></span><span class="lab">Jetway</span></button></div>
                     <div class="tile-cell"><button class="tile gsx-act" data-gsx="stairs" data-key="7" type="button"><b class="n">7</b><span class="tile-ico ico-stairs"></span><span class="lab">Stairs</span></button></div>
                     <div class="tile-cell"><button class="tile" data-fuel-sim="gsx" data-key="8" type="button"><b class="n">8</b><span class="tile-ico ico-fuel-direct"></span><span class="lab">GSX tanken</span></button></div>
@@ -127,7 +131,7 @@
                   <div class="tile-grid">
                     <div class="tile-cell"><button class="tile" id="btnLivery" data-key="1" type="button"><b class="n">1</b><span class="tile-ico ico-more"></span><span class="lab">Livery anfragen</span></button></div>
                     <div class="tile-cell"><button class="tile" id="btnWebLoginAlt" data-key="2" type="button"><b class="n">2</b><span class="tile-ico ico-login"></span><span class="lab">Website Login</span></button></div>
-                    <div class="tile-cell"><button class="tile" id="btnCancel" data-key="3" type="button"><b class="n">3</b><span class="tile-ico ico-reset"></span><span class="lab">Flug abbrechen</span></button></div>
+                    <div class="tile-cell"><button class="tile" id="btnCancel" type="button"><span class="tile-ico ico-reset"></span><span class="lab">Flug abbrechen</span></button></div>
                     <div class="tile-cell"><button class="tile" id="btnLog2" data-key="4" type="button"><b class="n">4</b><span class="tile-ico ico-efb"></span><span class="lab">Protokoll</span></button></div>
                     <div class="tile-cell"><button class="tile gsx-act" data-gsx="reset" data-key="5" type="button"><b class="n">5</b><span class="tile-ico ico-reset"></span><span class="lab">Reset Pos.</span></button></div>
                     <div class="tile-cell"><button class="tile gsx-act" data-gsx="reposition" data-key="6" type="button"><b class="n">6</b><span class="tile-ico ico-reposition"></span><span class="lab">Reposition</span></button></div>

@@ -1,7 +1,132 @@
 /* FlyConomy In-Game Panel – GSX-style command surface + local bridge */
+
+/* Pure rules of panel 1.4.31 (D11/D12) – no DOM, no network; tested with node. */
+var FlyConomyPanelLogic = (function () {
+  // Never sent twice via the second bridge URL: a timeout does not prove that the
+  // first request did not arrive (start, cancel, money, log).
+  var NO_FALLBACK = ['/start', '/cancel', '/refuel', '/end'];
+  var CANCEL_ARM_MS = 4000;
+
+  function pathOnly(path) {
+    var p = String(path || '');
+    var q = p.indexOf('?');
+    return q >= 0 ? p.slice(0, q) : p;
+  }
+
+  // Second URL only when the first one was not reachable at all (status 0,
+  // no timeout) and never for start/cancel/refuel/end.
+  function shouldTryFallback(path, err) {
+    if (!err || err.status !== 0 || err.timeout) return false;
+    return NO_FALLBACK.indexOf(pathOnly(path)) < 0;
+  }
+
+  // Two taps within 4 s cancel the flight; the first tap only arms.
+  function cancelTap(armedUntil, now) {
+    if (armedUntil && now <= armedUntil) return { fire: true, armedUntil: 0 };
+    return { fire: false, armedUntil: now + CANCEL_ARM_MS };
+  }
+
+  // Number keys never cancel, push back or load the EFB.
+  function keyAllowed(info) {
+    info = info || {};
+    if (info.id === 'btnCancel' || info.id === 'btnLoadEfb') return false;
+    if (info.gsx === 'pushback') return false;
+    return true;
+  }
+
+  function inflight(snap) {
+    return !!(snap && snap.active_flight_id);
+  }
+
+  // The server has a flight the client does not record (lost /start answer, no
+  // session on this PC): logging cannot work, only "Abbrechen" helps (review S8).
+  function unrecorded(snap) {
+    return !!(snap && snap.active_flight_id && snap.flight_unrecorded);
+  }
+
+  function efbLocked(snap) {
+    if (!inflight(snap)) return false;
+    var s = (snap && snap.last_sample) || {};
+    var gs = Number(s.ground_speed) || 0;
+    return s.on_ground === false || gs > 6;
+  }
+
+  function flightButton(snap) {
+    if (snap && snap.pending_start && !inflight(snap)) {
+      return { text: 'Start wartet – NICHT losfliegen', cls: 'cta amber', disabled: true };
+    }
+    if (unrecorded(snap)) return { text: 'Ohne Aufzeichnung – bitte abbrechen', cls: 'cta amber', disabled: true };
+    if (inflight(snap)) return { text: 'Flug loggen', cls: 'cta green', disabled: false };
+    return { text: 'Flug starten', cls: 'cta red', disabled: false };
+  }
+
+  function usd(n, signed) {
+    var v = Math.round(Number(n) || 0);
+    var a = String(Math.abs(v)).replace(/\B(?=(\d{3})+(?!\d))/g, '.');
+    if (signed) return (v >= 0 ? '+' : '−') + '$' + a;
+    return (v < 0 ? '−' : '') + '$' + a;
+  }
+
+  function lastResultText(res, nowSec) {
+    if (!res || !res.at) return '';
+    if (nowSec && nowSec - Number(res.at) > 900) return '';
+    var parts = ['Letzter Flug ' + (res.from || '?') + ' → ' + (res.to || '?')];
+    if (res.net != null) parts.push('netto ' + usd(res.net, true));
+    else if (res.paid != null) parts.push('ausgezahlt ' + usd(res.paid));
+    var und = res.undelivered || [];
+    if (und.length) {
+      var first = und[0] || {};
+      parts.push(
+        und.length +
+          ' nicht geliefert' +
+          (first.reason ? ' (' + String(first.reason).slice(0, 60) + ')' : '')
+      );
+    }
+    return parts.join(' · ');
+  }
+
+  function stickyText(snap, nowSec) {
+    if (!snap) return '';
+    if (snap.pending_start && !inflight(snap)) {
+      return snap.pending_start_text || 'Start wartet – NICHT losfliegen';
+    }
+    if (unrecorded(snap)) {
+      return (
+        snap.flight_unrecorded_text ||
+        'Flug läuft auf dem Server ohne Aufzeichnung – nur „Abbrechen“ hilft, dann neu starten.'
+      );
+    }
+    if (inflight(snap) && snap.title_mismatch) {
+      return 'Anderes Flugzeug geladen – Aufzeichnung pausiert, Flug NICHT abgebrochen.';
+    }
+    if (inflight(snap) && snap.position_mismatch) {
+      return snap.mismatch_kind === 'gap'
+        ? 'Flugzeug steht nicht am letzten Punkt – Flug NICHT abgebrochen. Unten wählen.'
+        : 'Positionssprung gemeldet – Aufzeichnung kurz pausiert, der Server prüft.';
+    }
+    if (!inflight(snap)) return lastResultText(snap.last_result, nowSec);
+    return '';
+  }
+
+  return {
+    NO_FALLBACK: NO_FALLBACK,
+    CANCEL_ARM_MS: CANCEL_ARM_MS,
+    shouldTryFallback: shouldTryFallback,
+    cancelTap: cancelTap,
+    keyAllowed: keyAllowed,
+    efbLocked: efbLocked,
+    unrecorded: unrecorded,
+    flightButton: flightButton,
+    lastResultText: lastResultText,
+    stickyText: stickyText,
+    usd: usd,
+  };
+})();
+
 var FlyConomyApp = (function () {
+  const L = FlyConomyPanelLogic;
   const BRIDGE_URLS = ['http://127.0.0.1:17474', 'http://localhost:17474'];
-  const PANEL_VERSION = '1.4.30';
+  const PANEL_VERSION = '1.4.31';
   const DESIGN_W = 400;
   const PHONE_H = 820;
   const CHROME_H = 48;
@@ -53,6 +178,7 @@ var FlyConomyApp = (function () {
   let lastStableScale = 1;
   let autoFitAttempts = 0;
   let autoFitDone = false;
+  let cancelArmedUntil = 0;
 
   function log(msg) {
     const el = $('log');
@@ -64,6 +190,8 @@ var FlyConomyApp = (function () {
     return String((desk && desk.aircraft && desk.aircraft.fuel_type) || 'jeta') === 'jeta';
   }
   function kgPer(desk) {
+    // Same density as the website and the server (fuelUnits.ts, fboOperationsService:
+    // Jet A 3.08 kg/gal, 100LL 2.72 kg/gal). Changed only together with them (review S8).
     return jetA(desk) ? 3.08 : 2.72;
   }
   function toUnit(gal, unit, desk) {
@@ -736,8 +864,10 @@ var FlyConomyApp = (function () {
         reject(e0);
         return;
       }
+      var timeoutMs = method === 'POST' ? 20000 : 8000;
+      var t0 = Date.now();
       try {
-        x.timeout = method === 'POST' ? 20000 : 8000;
+        x.timeout = timeoutMs;
       } catch (e1) {}
       if (opts && opts.body) {
         try {
@@ -753,13 +883,40 @@ var FlyConomyApp = (function () {
           data = {};
         }
         if (x.status >= 200 && x.status < 300 && data.ok !== false) resolve(data);
-        else reject(new Error((data && (data.error || data.message)) || ('HTTP ' + x.status)));
+        else if (x.status === 0) {
+          // readyState 4 comes before onerror/ontimeout – let those decide first;
+          // a request that ran into the time limit counts as timeout either way.
+          setTimeout(function () {
+            if (x._fcFailed) return;
+            x._fcFailed = true;
+            var e0 = new Error('Bridge nicht erreichbar (HTTP 0)');
+            e0.status = 0;
+            e0.timeout = !!x._fcTimeout || Date.now() - t0 >= timeoutMs - 250;
+            reject(e0);
+          }, 40);
+        } else {
+          var err = new Error((data && (data.error || data.message)) || ('HTTP ' + x.status));
+          err.status = x.status;
+          err.data = data;
+          reject(err);
+        }
       };
       x.onerror = function () {
-        reject(new Error('Bridge nicht erreichbar'));
+        if (x._fcFailed) return;
+        x._fcFailed = true;
+        var e1 = new Error('Bridge nicht erreichbar');
+        e1.status = 0;
+        e1.timeout = false;
+        reject(e1);
       };
       x.ontimeout = function () {
-        reject(new Error('Bridge Timeout'));
+        x._fcTimeout = true;
+        if (x._fcFailed) return;
+        x._fcFailed = true;
+        var e2 = new Error('Bridge Timeout');
+        e2.status = 0;
+        e2.timeout = true;
+        reject(e2);
       };
       try {
         x.send(opts && opts.body ? JSON.stringify(opts.body) : null);
@@ -783,6 +940,9 @@ var FlyConomyApp = (function () {
         return data;
       } catch (e) {
         last = e;
+        // D11: the second URL only when the first was unreachable – never after an
+        // answer or a timeout, and never for start/cancel/refuel/end.
+        if (!L.shouldTryFallback(path, e)) break;
       }
     }
     throw last || new Error('Bridge nicht erreichbar');
@@ -1084,15 +1244,23 @@ var FlyConomyApp = (function () {
         : name || (logged ? 'Bereit' : bridgeOk ? 'Nicht angemeldet' : 'Client offline');
     }
     paintChips(snap, bridgeOk);
-    if (!fuelBusy) showAlert('');
+    if (!fuelBusy) {
+      // D12: queued start, position question or the last result stay visible
+      const sticky = L.stickyText(snap, Date.now() / 1000);
+      showAlert(sticky, !!(sticky && !snap.pending_start && !snap.position_mismatch && !L.unrecorded(snap)));
+    }
 
     const btn = $('btnFlight');
     if (btn && !flightBusy) {
-      btn.disabled = !logged || !bridgeOk;
-      btn.className = 'cta ' + (inflight ? 'green' : 'red');
-      btn.textContent = inflight ? 'Flug loggen' : 'Flug starten';
+      const fb = L.flightButton(snap);
+      btn.disabled = !logged || !bridgeOk || fb.disabled;
+      btn.className = fb.cls;
+      btn.textContent = fb.text;
     }
     if ($('btnCancel')) $('btnCancel').disabled = !logged || !inflight;
+    paintCancel();
+    if ($('btnLoadEfb')) $('btnLoadEfb').disabled = L.efbLocked(snap);
+    setHidden($('mismatchBar'), !(inflight && snap.mismatch_choice_open));
     if ($('btnLivery')) $('btnLivery').disabled = !logged;
     if ($('btnReport')) $('btnReport').disabled = !bridgeOk;
     if ($('btnWebLogin')) $('btnWebLogin').disabled = !bridgeOk || webLoginBusy;
@@ -1132,6 +1300,28 @@ var FlyConomyApp = (function () {
         applySimPayload(load);
       }
     } else if (!inflight) payloadAppliedAt = 0;
+  }
+
+  function paintCancel() {
+    const b = $('btnCancel');
+    if (!b) return;
+    const armed = cancelArmedUntil && Date.now() <= cancelArmedUntil;
+    if (!armed) cancelArmedUntil = 0;
+    const lab = b.querySelector('.lab');
+    if (lab) lab.textContent = armed ? 'Nochmal tippen!' : 'Flug abbrechen';
+    if (armed) b.classList.add('armed');
+    else b.classList.remove('armed');
+  }
+
+  async function positionChoice(choice) {
+    try {
+      const data = await bridge('/position-choice', { method: 'POST', body: { choice: choice } });
+      log(choice === 'reposition' ? 'Flugzeug wird zurueckgesetzt...' : 'Weiterflug ab hier gemeldet');
+      showAlert((data && data.message) || '', true);
+      await refresh();
+    } catch (e) {
+      showAlert(errText(e));
+    }
   }
 
   function sellerSelected() {
@@ -1307,13 +1497,18 @@ var FlyConomyApp = (function () {
   }
 
   async function onLoadEfb() {
+    if (L.efbLocked(snapCache)) {
+      showAlert('„Ins EFB laden“ ist im Flug gesperrt.');
+      return;
+    }
     try {
       var data;
       try {
         data = await bridge('/apply-load', { method: 'POST', body: {} });
       } catch (e1) {
-        var msg = errText(e1);
-        if (String(msg).indexOf('HTTP 0') >= 0 || String(msg).indexOf('Timeout') >= 0) {
+        // GET only when the POST never reached the client (not after a timeout:
+        // the load may already be on its way) and never during a flight.
+        if (e1 && e1.status === 0 && !e1.timeout && !(snapCache && snapCache.active_flight_id)) {
           data = await bridge('/apply-load');
         } else {
           throw e1;
@@ -1452,7 +1647,9 @@ var FlyConomyApp = (function () {
     const root = roots[view] || $('viewHome');
     if (!root) return;
     const btn = root.querySelector('[data-key="' + k + '"]');
-    if (btn) btn.click();
+    if (!btn) return;
+    if (!L.keyAllowed({ id: btn.id, gsx: btn.getAttribute('data-gsx') })) return;
+    btn.click();
   }
 
   async function onSpawn(kind) {
@@ -1657,13 +1854,31 @@ var FlyConomyApp = (function () {
     if ($('btnFlight')) $('btnFlight').addEventListener('click', onFlight);
     if ($('btnCancel'))
       $('btnCancel').addEventListener('click', async function () {
+        // D11: two taps within 4 s – a single (accidental) tap only arms.
+        const tap = L.cancelTap(cancelArmedUntil, Date.now());
+        cancelArmedUntil = tap.armedUntil;
+        if (!tap.fire) {
+          paintCancel();
+          showAlert('Nochmal tippen, um den Flug wirklich abzubrechen.');
+          setTimeout(paintCancel, L.CANCEL_ARM_MS + 50);
+          return;
+        }
+        paintCancel();
         try {
-          await bridge('/cancel', { method: 'POST', body: {} });
-          log('Abgebrochen');
+          const data = await bridge('/cancel', { method: 'POST', body: { confirm: 'two-tap' } });
+          log((data && data.pending_confirm && data.message) || 'Abgebrochen');
           await refresh();
         } catch (e) {
           log(errText(e));
         }
+      });
+    if ($('btnPosBack'))
+      $('btnPosBack').addEventListener('click', function () {
+        void positionChoice('reposition');
+      });
+    if ($('btnPosHere'))
+      $('btnPosHere').addEventListener('click', function () {
+        void positionChoice('continue');
       });
     if ($('btnLivery'))
       $('btnLivery').addEventListener('click', async function () {
@@ -1785,7 +2000,13 @@ var FlyConomyApp = (function () {
     }, 1200);
   }
 
-  return { start: start, applyAtcId: applyAtcId, onPanelActive: onPanelActive };
+  return {
+    start: start,
+    applyAtcId: applyAtcId,
+    onPanelActive: onPanelActive,
+    // node tests only (backend/test/unit/panelLogic.test.ts)
+    _bridge: bridge,
+  };
 })();
 
 if (typeof TemplateElement !== 'undefined') {

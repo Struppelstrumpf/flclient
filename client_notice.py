@@ -55,6 +55,19 @@ def error_code(raw: str) -> str:
     return f"FC-{s[:40]}"
 
 
+def _safe(fn):
+    try:
+        return fn()
+    except Exception:
+        return None
+
+
+def _clock():
+    from flyconomy_client import SERVER_CLOCK
+
+    return SERVER_CLOCK
+
+
 def build_diagnostics() -> dict[str, Any]:
     from flyconomy_client import CLIENT_VERSION, STATE
 
@@ -81,6 +94,20 @@ def build_diagnostics() -> dict[str, Any]:
         "last_message": STATE.last_message or STATE.ui_status,
         "user_id": user.get("id"),
         "user_name": user.get("name") or user.get("username"),
+        # 2.11.13 diagnostics (D5/D9/D11): clock offset, SimConnect read times,
+        # what the panel engine sends as Origin, restore and queue states.
+        "clock_offset_sec": _safe(lambda: round(_clock().raw_ms / 1000.0, 1) if _clock().known else None),
+        "sim_read_ms": _safe(lambda: dict(STATE.sim.read_stats)),
+        "panel_origin_seen": getattr(STATE, "_panel_origin_seen", None),
+        # first request the bridge refused (Origin / Sec-Fetch-Site / Host) – beta check
+        "panel_origin_rejected": getattr(STATE, "_panel_origin_rejected", None),
+        "flight_unrecorded": bool(STATE.active_flight_id and not STATE.monitoring),
+        "restore_state": getattr(STATE, "restore_state", None),
+        "position_mismatch": bool(getattr(STATE, "_position_mismatch", False)),
+        "mismatch_kind": getattr(STATE, "_mismatch_kind", ""),
+        "pending_end": bool(getattr(STATE, "pending_end", None)),
+        "pending_start": bool(getattr(STATE, "pending_start", None)),
+        "max_sim_rate": getattr(STATE, "max_sim_rate", None),
         "last_sample": {
             "latitude": sample.get("latitude"),
             "longitude": sample.get("longitude"),
@@ -129,6 +156,48 @@ def open_report(*, code: str = "", title: str = "", message: str = "") -> None:
         _open_report(payload)
 
     _on_ui(open_it)
+
+
+def ask_choice(
+    title: str,
+    message: str,
+    choices: list,
+    on_choice,
+    *,
+    code: str = "",
+) -> None:
+    """Non-blocking question with 2–3 buttons; on_choice(key) runs on the UI thread
+    ("" when the window is closed without a choice). choices: [(key, label, style)]
+    with style primary | secondary | danger."""
+    payload = {
+        "title": str(title or "FlyConomy"),
+        "message": str(message or ""),
+        "code": error_code(code) if code else "",
+        "choices": [tuple(c) for c in (choices or [])][:3],
+        "on_choice": on_choice,
+    }
+
+    def open_it() -> None:
+        master = _master()
+        if master is None:
+            return
+        ChoiceWindow(master, payload)
+
+    _on_ui(open_it)
+
+
+def _master():
+    try:
+        from flyconomy_client import STATE
+
+        master = getattr(STATE, "tk_root", None)
+    except Exception:
+        master = None
+    if master is None:
+        import tkinter as tk
+
+        master = tk._default_root  # type: ignore[attr-defined]
+    return master
 
 
 def _on_ui(fn) -> None:
@@ -377,6 +446,96 @@ class NoticeWindow:
         with _lock:
             if _notice_win is self:
                 _notice_win = None
+
+
+class ChoiceWindow:
+    """Question with up to three answers (cancel confirmation, D1 position choice)."""
+
+    def __init__(self, master, payload: dict) -> None:
+        import tkinter as tk
+        from tkinter import font as tkfont
+
+        self.tk = tk
+        self._callback = payload.get("on_choice")
+        self._done = False
+        self.win = tk.Toplevel(master)
+        self.win.title("FlyConomy")
+        self.win.configure(bg=BG)
+        self.win.geometry("500x380")
+        self.win.minsize(440, 320)
+        try:
+            self.win.attributes("-topmost", True)
+        except Exception:
+            pass
+        self.win.protocol("WM_DELETE_WINDOW", lambda: self.pick(""))
+        title_f = tkfont.Font(family="Segoe UI", size=15, weight="bold")
+        sub_f = tkfont.Font(family="Segoe UI", size=10)
+        btn_f = tkfont.Font(family="Segoe UI", size=10, weight="bold")
+        small_f = tkfont.Font(family="Segoe UI", size=8)
+        outer = tk.Frame(self.win, bg=BG, padx=22, pady=18)
+        outer.pack(fill="both", expand=True)
+        tk.Label(outer, text="FLYCONOMY", font=small_f, bg=BG, fg=BLUE).pack(anchor="w")
+        tk.Label(
+            outer,
+            text=payload.get("title") or "FlyConomy",
+            font=title_f,
+            bg=BG,
+            fg=INK,
+            wraplength=440,
+            justify="left",
+        ).pack(anchor="w", pady=(6, 8))
+        if payload.get("code"):
+            tk.Label(outer, text=payload["code"], font=small_f, bg=BG, fg=AMBER).pack(anchor="w")
+        tk.Label(
+            outer,
+            text=payload.get("message") or "",
+            font=sub_f,
+            bg=BG,
+            fg=MUTED,
+            wraplength=440,
+            justify="left",
+        ).pack(anchor="w", pady=(4, 0))
+        btns = tk.Frame(outer, bg=BG)
+        btns.pack(fill="x", pady=(18, 0), side="bottom")
+        colors = {
+            "primary": (BLUE, BLUE_HOVER, "#FFFFFF"),
+            "secondary": (CARD, BLUE_HOVER, INK),
+            "danger": (RED, RED_HOVER, "#FFFFFF"),
+        }
+        for key, label, style in payload.get("choices") or []:
+            bg, active, fg = colors.get(style, colors["secondary"])
+            tk.Button(
+                btns,
+                text=label,
+                command=lambda k=key: self.pick(k),
+                bg=bg,
+                fg=fg,
+                activebackground=active,
+                activeforeground="#FFFFFF",
+                relief="flat",
+                bd=0,
+                font=btn_f,
+                padx=12,
+                pady=10,
+                cursor="hand2",
+                wraplength=150,
+            ).pack(side="left", expand=True, fill="x", padx=4)
+        _bring(self.win)
+
+    def pick(self, key: str) -> None:
+        if self._done:
+            return
+        self._done = True
+        try:
+            self.win.destroy()
+        except Exception:
+            pass
+        cb = self._callback
+        if cb is not None:
+            try:
+                cb(str(key or ""))
+            except Exception:
+                pass
 
 
 class ReportWindow:

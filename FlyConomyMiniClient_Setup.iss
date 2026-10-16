@@ -1,6 +1,6 @@
 ; FlyConomy MiniClient – Installer (Inno Setup 6)
 #define MyAppName "FlyConomy MiniClient"
-#define MyAppVersion "2.11.12.1"
+#define MyAppVersion "2.11.13"
 #define MyAppPublisher "FlyConomy"
 #define MyAppURL "https://flyconomy.de"
 ; Source of exactly this version (AGPL 6 d): the release tag v<version> of the public repo

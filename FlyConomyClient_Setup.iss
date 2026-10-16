@@ -3,6 +3,7 @@
 #define MyAppVersion "2.11.4"
 #define MyAppPublisher "FlyConomy"
 #define MyAppURL "https://flyconomy.de"
+#define MySourceURL "https://github.com/Struppelstrumpf/flclient"
 #define MyAppExeName "FlyConomyClient.exe"
 
 [Setup]
@@ -42,6 +43,16 @@ Name: "desktopicon"; Description: "Desktop-Verknüpfung erstellen"; GroupDescrip
 [Files]
 Source: "dist\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "logo.ico"; DestDir: "{app}"; Flags: ignoreversion
+Source: "LICENSE"; DestDir: "{app}"; DestName: "LICENSE.txt"; Flags: ignoreversion
+Source: "THIRD-PARTY-NOTICES.md"; DestDir: "{app}"; Flags: ignoreversion
+Source: "licenses\*"; DestDir: "{app}\licenses"; Flags: ignoreversion recursesubdirs createallsubdirs
+
+[INI]
+; Link to the source code (GNU AGPL-3.0) in the program folder
+Filename: "{app}\Quellcode.url"; Section: "InternetShortcut"; Key: "URL"; String: "{#MySourceURL}"
+
+[UninstallDelete]
+Type: files; Name: "{app}\Quellcode.url"
 
 [Icons]
 Name: "{group}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; IconFilename: "{app}\logo.ico"
@@ -52,8 +63,8 @@ Name: "{autodesktop}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: de
 Filename: "{app}\{#MyAppExeName}"; Description: "FlyConomy starten und mit Discord anmelden"; Flags: nowait postinstall skipifsilent
 
 [Messages]
-german.WelcomeLabel2=Dieser Assistent installiert [name/ver] auf Ihrem Computer.%n%nNach der Installation melden Sie sich einmal mit Discord an. Ohne Login ist die App nicht nutzbar – es gibt keinen Gastmodus.
-english.WelcomeLabel2=This will install [name/ver] on your computer.%n%nAfter installation, sign in once with Discord. Without login the app cannot be used – there is no guest mode.
+german.WelcomeLabel2=Dieser Assistent installiert [name/ver] auf Ihrem Computer.%n%nNach der Installation melden Sie sich einmal mit Discord an. Ohne Login ist die App nicht nutzbar – es gibt keinen Gastmodus.%n%nQuellcode und Lizenz (GNU AGPL-3.0): {#MySourceURL}
+english.WelcomeLabel2=This will install [name/ver] on your computer.%n%nAfter installation, sign in once with Discord. Without login the app cannot be used – there is no guest mode.%n%nSource code and license (GNU AGPL-3.0): {#MySourceURL}
 
 [Code]
 function InitializeUninstall(): Boolean;

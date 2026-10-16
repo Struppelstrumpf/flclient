@@ -15,11 +15,14 @@ GREEN = "#2EC27F"
 GREEN_DIM = "#1A7A52"
 RED = "#E24B4A"
 RED_HOVER = "#C13A3A"
+AMBER = "#E8A33D"
 LINE = "#1E3A5F"
 
-_busy = False
+_busy = False  # a worker is sending right now (only one action_end, D2)
 _cancel = threading.Event()
 _win = None
+_lock = threading.Lock()
+SUCCESS_AUTO_CLOSE_MS = 20_000
 
 
 def t_ui(de: str, en: str) -> str:
@@ -31,8 +34,19 @@ def t_ui(de: str, en: str) -> str:
         return de
 
 
+def _window_alive(win) -> bool:
+    try:
+        return bool(win is not None and win.win.winfo_exists())
+    except Exception:
+        return False
+
+
 def start_flight_log_ui() -> dict:
-    """Open the logging window and submit the flight in the background."""
+    """Open the logging window and submit the flight in the background.
+
+    D2: never two windows or two senders. A window that still shows a failed
+    attempt is reused and simply tries again.
+    """
     global _busy
     from flyconomy_client import STATE, local_end_block_reason
 
@@ -40,15 +54,23 @@ def start_flight_log_ui() -> dict:
     if blocked:
         STATE.last_error = blocked
         raise RuntimeError(blocked)
-    if _busy or getattr(STATE, "_log_ui_open", False):
-        return {"ok": True, "logging": True, "message": t_ui("Wird bereits geloggt…", "Already logging…")}
-    if not STATE.monitoring and not STATE.active_flight_id:
-        raise RuntimeError(t_ui("Kein aktiver Flug.", "No active flight."))
-
-    _busy = True
-    STATE._log_ui_open = True
-    STATE._auto_ending = True
-    _cancel.clear()
+    with _lock:
+        if _busy:
+            return {"ok": True, "logging": True, "message": t_ui("Wird bereits geloggt…", "Already logging…")}
+        if not STATE.monitoring and not STATE.active_flight_id:
+            raise RuntimeError(t_ui("Kein aktiver Flug.", "No active flight."))
+        existing = _win
+        _busy = True
+        STATE._log_ui_open = True
+        _cancel.clear()
+    if existing is not None:
+        # close() resets _win, so a window here still exists; after() hands the
+        # retry to the UI thread (a destroyed window raises and we open a new one).
+        try:
+            existing.win.after(0, existing.retry)
+            return {"ok": True, "logging": True}
+        except Exception:
+            pass
 
     root = getattr(STATE, "tk_root", None)
     if root is not None:
@@ -57,7 +79,11 @@ def start_flight_log_ui() -> dict:
             return {"ok": True, "logging": True}
         except Exception:
             pass
-    threading.Thread(target=_standalone, daemon=True).start()
+    try:
+        threading.Thread(target=_standalone, daemon=True).start()
+    except Exception:
+        _release()
+        raise
     return {"ok": True, "logging": True}
 
 
@@ -76,15 +102,21 @@ def _standalone() -> None:
 
 def _open_window(master) -> None:
     global _win
-    if _win is not None:
+    if _win is not None and _window_alive(_win):
+        # The old check asked the wrapper object (no winfo_exists) and opened a
+        # second window every time (D2).
         try:
-            if _win.winfo_exists():
-                _win.deiconify()
-                _win.lift()
-                return
+            _win.restore()
+            if _win._phase != "logging":
+                _win.retry()
+            return
         except Exception:
             pass
-    _win = FlightLogWindow(master)
+    try:
+        _win = FlightLogWindow(master)
+    except Exception:
+        _release()
+        raise
 
 
 class FlightLogWindow:
@@ -104,11 +136,15 @@ class FlightLogWindow:
             self.win.attributes("-topmost", True)
         except Exception:
             pass
-        self.win.protocol("WM_DELETE_WINDOW", self.minimize)
+        # X: minimise while sending, close once a result is shown (D2 – it did nothing).
+        self.win.protocol("WM_DELETE_WINDOW", self.on_close)
         self._phase = "logging"
         self._result_ok = False
+        self._result_kind = ""
+        self._session_key = ""
         self._anim = 0.0
         self._alive = True
+        self._worker_alive = False
         self._confirm = None
 
         title_f = tkfont.Font(family="Segoe UI", size=16, weight="bold")
@@ -236,8 +272,44 @@ class FlightLogWindow:
         self._err_code = ""
 
         self._tick_bar()
-        threading.Thread(target=self._worker, daemon=True).start()
+        self._start_worker()
         self._bring_front()
+
+    def _refresh_session_key(self) -> None:
+        """Review S8: remember WHICH flight this window logs – the retry loop may book
+        it in between; then the window shows that result instead of an error."""
+        try:
+            from flyconomy_client import current_end_session_key
+
+            self._session_key = current_end_session_key() or getattr(self, "_session_key", "")
+        except Exception:
+            pass
+
+    def _start_worker(self) -> None:
+        try:
+            from flyconomy_client import STATE as _st
+
+            # D2: "auto ending" only while a worker really runs
+            _st._auto_ending = True
+        except Exception:
+            pass
+        self._refresh_session_key()
+        self._worker_alive = True
+        threading.Thread(target=self._worker_guarded, daemon=True).start()
+
+    def _worker_guarded(self) -> None:
+        try:
+            self._worker()
+        except Exception as e:
+            self._finish(False, str(e) or t_ui("Unbekannter Fehler.", "Unknown error."))
+        finally:
+            self._worker_alive = False
+
+    def on_close(self) -> None:
+        if self._phase == "logging":
+            self.minimize()
+        else:
+            self.close()
 
     def _bring_front(self) -> None:
         try:
@@ -369,9 +441,22 @@ class FlightLogWindow:
             self._anim += 0.018
         elif self._result_ok:
             c.create_rectangle(1, 5, w - 1, h - 3, fill=GREEN, outline="")
+        elif self._result_kind == "unknown":
+            c.create_rectangle(1, 5, w - 1, h - 3, fill=AMBER, outline="")
         else:
             c.create_rectangle(1, 5, w - 1, h - 3, fill=RED, outline="")
         self.win.after(16, self._tick_bar)
+
+    def _logged_meanwhile(self) -> Optional[dict]:
+        """The server's answer if this window's flight was logged in the meantime
+        (by the background retry loop) – review S8."""
+        try:
+            from flyconomy_client import ended_result_for
+
+            key = getattr(self, "_session_key", "")
+            return ended_result_for(key) if key else None
+        except Exception:
+            return None
 
     def _worker(self) -> None:
         from flyconomy_client import (
@@ -383,6 +468,10 @@ class FlightLogWindow:
 
         last_err = ""
         while not _cancel.is_set():
+            done = self._logged_meanwhile()
+            if done is not None:
+                self._finish(True, _logged_text(done))
+                return
             try:
                 result = action_end(notify=False, persist_retry=False)
             except RetryableError as e:
@@ -407,18 +496,48 @@ class FlightLogWindow:
                     )
                     self._sleep_or_cancel(4.0)
                     continue
+                done = self._logged_meanwhile()
+                if done is not None:
+                    self._finish(True, _logged_text(done))
+                    return
                 self._finish(False, last_err or t_ui("Flug abgebrochen.", "Flight cancelled."))
                 return
             if result.get("retry"):
-                self._set_sub(
-                    t_ui(
-                        "Server nicht erreichbar – neuer Versuch in ein paar Sekunden…",
-                        "Server unreachable — retrying in a few seconds…",
+                if result.get("busy"):
+                    self._set_sub(
+                        t_ui(
+                            "Der Server bucht den Flug gerade – das Ergebnis kommt gleich…",
+                            "The server is booking the flight right now – the result follows…",
+                        )
                     )
-                )
-                self._sleep_or_cancel(4.0)
+                else:
+                    self._set_sub(
+                        t_ui(
+                            "Server nicht erreichbar – neuer Versuch in ein paar Sekunden…",
+                            "Server unreachable — retrying in a few seconds…",
+                        )
+                    )
+                try:
+                    wait = float(result.get("retry_after_seconds") or 4.0)
+                except (TypeError, ValueError):
+                    wait = 4.0
+                self._sleep_or_cancel(max(4.0, min(wait, 15.0)))
                 continue
             if result.get("rejected"):
+                done = self._logged_meanwhile()
+                if done is not None:
+                    self._finish(True, _logged_text(done))
+                    return
+                if result.get("unknown"):
+                    # "Kein aktiver Flug" from the old server after a resend: most
+                    # likely paid already – never shown as "cancelled" (review S8).
+                    self._finish(
+                        False,
+                        str(result.get("message") or ""),
+                        code="FC-END-UNKNOWN",
+                        kind="unknown",
+                    )
+                    return
                 self._finish(False, str(result.get("message") or t_ui("Flug abgebrochen.", "Flight cancelled.")))
                 return
             if result.get("keep_flying"):
@@ -458,10 +577,15 @@ class FlightLogWindow:
         except Exception:
             pass
 
-    def _finish(self, ok: bool, message: str, code: str = "") -> None:
+    def _finish(self, ok: bool, message: str, code: str = "", kind: str = "") -> None:
+        # D2: the sender is done – free the flags right away (the window may stay
+        # open with the result). The auto-end waits until the window is closed.
+        _worker_done()
+
         def apply() -> None:
             self._phase = "done"
             self._result_ok = ok
+            self._result_kind = kind or ""
             self._err_code = code or ""
             still = False
             try:
@@ -472,6 +596,10 @@ class FlightLogWindow:
                 still = False
             if ok:
                 self.title_var.set(t_ui("Flug geloggt", "Flight logged"))
+            elif kind == "unknown":
+                self.title_var.set(
+                    t_ui("Status unklar – bitte unter „Flüge“ prüfen", "Status unclear – please check “Flights”")
+                )
             elif still:
                 self.title_var.set(t_ui("Flug läuft weiter", "Flight still active"))
             else:
@@ -494,20 +622,38 @@ class FlightLogWindow:
             except Exception:
                 pass
             self.restore()
+            if ok:
+                # D2: a success closes by itself after 20 s
+                try:
+                    self.win.after(SUCCESS_AUTO_CLOSE_MS, self._auto_close)
+                except Exception:
+                    pass
 
         try:
             self.win.after(0, apply)
         except Exception:
             pass
-        # Keep the window (and _auto_ending) until the pilot closes it.
-        # Releasing here spawned a new log dialog every 2s while the brake was set.
+
+    def _auto_close(self) -> None:
+        if self._phase == "done" and self._result_ok:
+            self.close()
 
     def retry(self) -> None:
-        if self._phase == "logging":
-            return
+        global _busy
+        with _lock:
+            if self._phase == "logging" and self._worker_alive:
+                return
+            _busy = True
+            try:
+                from flyconomy_client import STATE as _st
+
+                _st._log_ui_open = True
+            except Exception:
+                pass
         _cancel.clear()
         self._phase = "logging"
         self._result_ok = False
+        self._result_kind = ""
         self._err_code = ""
         self.title_var.set(t_ui("Der Flug wird geloggt…", "Logging the flight…"))
         self.sub_var.set(
@@ -527,7 +673,7 @@ class FlightLogWindow:
             self.btn_abort.pack(side="left", expand=True, fill="x", padx=(8, 0))
         except Exception:
             pass
-        threading.Thread(target=self._worker, daemon=True).start()
+        self._start_worker()
         self._bring_front()
 
     def report(self) -> None:
@@ -559,23 +705,33 @@ class FlightLogWindow:
 
 
 def _logged_text(result: dict) -> str:
-    from flyconomy_client import validation_route_icaos
+    """Net result and undelivered jobs (D12)."""
+    from flyconomy_client import end_result_lines
 
-    validation = (result or {}).get("validation") or {}
-    status = str(validation.get("status") or "OK")
-    pay = result.get("total_payment")
-    from_icao, to_icao = validation_route_icaos(result)
-    pay_txt = f"${pay}" if pay is not None else "-"
-    return t_ui(
-        f"{from_icao} → {to_icao}\nStatus: {status}\nBelohnung: {pay_txt}",
-        f"{from_icao} → {to_icao}\nStatus: {status}\nPay: {pay_txt}",
-    )
+    return "\n".join(end_result_lines(result or {}))
+
+
+def _worker_done() -> None:
+    global _busy
+    with _lock:
+        _busy = False
+    try:
+        from flyconomy_client import AUTO_END_FAIL_COOLDOWN_SEC, STATE
+
+        STATE._auto_ending = False
+        STATE._park_ticks = 0
+        STATE._auto_end_cooldown_until = max(
+            float(STATE._auto_end_cooldown_until or 0), time.time() + AUTO_END_FAIL_COOLDOWN_SEC
+        )
+    except Exception:
+        pass
 
 
 def _release() -> None:
     global _busy, _win
-    _busy = False
-    _win = None
+    with _lock:
+        _busy = False
+        _win = None
     try:
         from flyconomy_client import STATE
 
