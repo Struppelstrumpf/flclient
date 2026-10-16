@@ -555,9 +555,18 @@ class FlightLogWindow:
             return
 
         try:
-            action_cancel()
+            cancelled = action_cancel()
         except Exception:
-            pass
+            cancelled = {}
+        if isinstance(cancelled, dict) and cancelled.get("code") in ("CANCEL_UNCONFIRMED", "END_BUSY"):
+            # RL-C05: the server did not confirm – the stored landing stays and is resent later.
+            self._finish(
+                False,
+                str(cancelled.get("error") or ""),
+                code="FC-CANCEL-UNCONFIRMED",
+                kind="unknown",
+            )
+            return
         self._finish(
             False,
             t_ui(

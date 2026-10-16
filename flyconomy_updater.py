@@ -4,10 +4,17 @@
 The full client is no longer offered (owner decision Q19, 2026-10-14): it is
 neither installed nor updated any more; an existing installation keeps
 working and can still be uninstalled here.
+
+1.0.7 (release-2, RL-C03): every download is checked against the SHA-256 that
+versions.json lists in "hashes" before it is installed or unpacked. A mismatch is
+retried with a fresh versions.json (a file uploaded a moment ago may not be in the
+list yet); if it stays wrong nothing is installed and the next check (20 min) tries
+again – a wrong hash never blocks updates for good.
 """
 from __future__ import annotations
 
 import ctypes
+import hashlib
 import json
 import os
 import re
@@ -31,7 +38,7 @@ except ImportError:
 
 SITE_URL = "https://flyconomy.de"
 VERSIONS_URL = f"{SITE_URL}/api/live/versions.json"
-UPDATER_VERSION = "1.0.6"
+UPDATER_VERSION = "1.0.7"
 
 try:
     from flyconomy_webapp import desktop_shortcut_path, ensure_desktop_shortcut
@@ -40,6 +47,9 @@ except ImportError:
     ensure_desktop_shortcut = None  # type: ignore
 PANEL_PKG = "flyconomy-ingame-panel"
 CHECK_EVERY_SEC = 20 * 60
+# RL-C03: a wrong SHA-256 is retried this often with a fresh versions.json, this far apart.
+HASH_RETRIES = 2
+HASH_RETRY_WAIT_SEC = 20.0
 CHECK_WHEN_FLIGHT_SEC = 45
 BRIDGE_STATUS = "http://127.0.0.1:17474"
 MUTEX_NAME = "Local\\FlyConomyUpdaterSingleton"
@@ -82,6 +92,14 @@ def load_config() -> dict:
 
 def save_config(cfg: dict) -> None:
     config_path().write_text(json.dumps(cfg, indent=2), encoding="utf-8")
+
+
+def file_sha256(path: Path) -> str:
+    h = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def version_tuple(ver: str) -> tuple[int, ...]:
@@ -368,6 +386,8 @@ class Updater:
             "fullClientUrl": "",
             "updaterUrl": "",
         }
+        # RL-C03: file name -> SHA-256 from versions.json "hashes".
+        self.hashes: dict[str, str] = {}
         # Q19: retired unless the server explicitly offers it again.
         self.full_retired = True
         self.window: Any = None
@@ -465,6 +485,51 @@ class Updater:
         self.latest["updaterUrl"] = str(
             data.get("updaterUrl") or f"{SITE_URL}/downloads/FlyConomyUpdater_Setup.exe"
         )
+        raw_hashes = data.get("hashes")
+        self.hashes = {
+            str(k): str(v).strip().lower()
+            for k, v in (raw_hashes.items() if isinstance(raw_hashes, dict) else [])
+            if isinstance(v, str) and re.fullmatch(r"[0-9a-fA-F]{64}", v.strip())
+        }
+
+    def expected_hash(self, url: str) -> str:
+        """SHA-256 versions.json lists for the file of this URL ('' = not listed)."""
+        name = str(url or "").split("?", 1)[0].rstrip("/").rsplit("/", 1)[-1]
+        return self.hashes.get(name, "")
+
+    def download_verified(self, url: str, dest: Path) -> None:
+        """RL-C03: download and compare with versions.json; retry with fresh hashes; else stop.
+
+        No hash listed (old server, file not scanned yet) = install as before (TLS only) and
+        say so in the log. A mismatch never installs: after the retries this cycle ends with
+        an error and the next one (20 min) starts again."""
+        problem = ""
+        for attempt in range(HASH_RETRIES + 1):
+            if attempt:
+                time.sleep(HASH_RETRY_WAIT_SEC)
+                try:
+                    self.fetch_latest()
+                except Exception as e:
+                    self.log(f"versions.json: {e}")
+            self.download(url, dest)
+            expected = self.expected_hash(url)
+            if not expected:
+                self.log(f"Hinweis: keine Prüfsumme für {dest.name} auf dem Server – Download nur per HTTPS geprüft.")
+                return
+            got = file_sha256(dest)
+            if got == expected:
+                self.log(f"Prüfsumme ok: {dest.name}")
+                return
+            problem = f"{dest.name}: SHA-256 {got[:12]}… statt {expected[:12]}…"
+            self.log(f"Prüfsumme stimmt nicht ({problem}) – neuer Versuch.")
+        try:
+            dest.unlink()
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"Download nicht installiert – die Prüfsumme stimmt nicht ({problem}). "
+            "Der Updater versucht es beim nächsten Durchlauf erneut."
+        )
 
     def download(self, url: str, dest: Path) -> None:
         dest.parent.mkdir(parents=True, exist_ok=True)
@@ -490,7 +555,7 @@ class Updater:
         url = self.latest["panelUrl"]
         zip_path = Path(tempfile.gettempdir()) / "FlyConomy-MSFS-Panel.zip"
         self.log("Panel wird heruntergeladen…")
-        self.download(url, zip_path)
+        self.download_verified(url, zip_path)
         extract = Path(tempfile.gettempdir()) / "flyconomy-panel-extract"
         if extract.exists():
             shutil.rmtree(extract, ignore_errors=True)
@@ -527,7 +592,7 @@ class Updater:
         if was_running or MINI_EXE.is_file():
             self._guard_open_flight()
         self.log("MiniClient wird heruntergeladen…")
-        self.download(url, setup)
+        self.download_verified(url, setup)
         if was_running or MINI_EXE.is_file():
             self._guard_open_flight()
             self.log("Alten MiniClient beenden…")
@@ -551,7 +616,7 @@ class Updater:
         if was_running or FULL_EXE.is_file():
             self._guard_open_flight()
         self.log("Vollen Client herunterladen…")
-        self.download(url, setup)
+        self.download_verified(url, setup)
         if was_running or FULL_EXE.is_file():
             self._guard_open_flight()
             self.log("Alten Client beenden…")
@@ -571,7 +636,7 @@ class Updater:
         ver = str(self.latest.get("updater") or "new").strip()
         setup = Path(tempfile.gettempdir()) / f"FlyConomyUpdater_Setup_{ver}.exe"
         self.log(f"Updater {UPDATER_VERSION} -> {ver}: Download...")
-        self.download(url, setup)
+        self.download_verified(url, setup)
         if not setup.is_file() or setup.stat().st_size < 10_000:
             raise RuntimeError("Updater-Download unvollständig.")
         exe_after = UPDATER_DIR / "FlyConomyUpdater.exe"

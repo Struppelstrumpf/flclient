@@ -21,19 +21,21 @@ Der **FlyConomy-Server, die Website, die Datenbank und der Betrieb** gehören **
 
 Der Branch `main` ist der Entwicklungsstand. Jede ausgelieferte Version bekommt einen Tag `v<Version>`; nur getaggte Stände entsprechen ausgelieferten Programmen. Welche Version gerade angeboten wird, steht auf [flyconomy.de/downloads](https://flyconomy.de/downloads). Bitte immer die aktuelle Version verwenden; ältere Versionen bekommen keine Fehler- und Sicherheitskorrekturen.
 
-#### Branch `main`
+#### Tag `v2.11.13` und Branch `main` – ausgelieferter Stand (Pflicht-Update für alle)
 
-| Programm | Version | Hinweis |
-|---|---|---|
-| MiniClient | 2.11.13 | |
-| Updater | 1.0.6 | installiert den vollen Client nicht mehr |
-| Browser inApp | 1.0.1 | unverändert gegenüber `v2.11.12.1` |
-| Panel-Kopie `ui/phone` | 1.4.31 | |
-| Voller Client | – | eingestellt, wird nicht mehr angeboten |
+| Programm | Version | Build | Hinweis |
+|---|---|---|---|
+| MiniClient | 2.11.13 | 16.10.2026 | Pflicht-Update: ältere MiniClients starten danach keine Flüge mehr |
+| Updater | 1.0.7 | 16.10.2026 | prüft jeden Download gegen die SHA-256 auf flyconomy.de; installiert den vollen Client nicht mehr |
+| Browser inApp | 1.0.1 | 22.08.2026 | unverändert gegenüber `v2.11.12.1` |
+| Panel-Kopie `ui/phone` | 1.4.31 | – | |
+| Voller Client | – | – | eingestellt, wird nicht mehr angeboten |
 
-Ab diesem Stand installieren die Setups von MiniClient, Updater und vollem Client auch `LICENSE.txt`, `THIRD-PARTY-NOTICES.md`, den Ordner `licenses/` und eine Verknüpfung `Quellcode.url` zum Quellstand ihrer Version (Tag `v<Version>`) in den Programmordner.
+Die Setups von MiniClient und Updater installieren `LICENSE.txt`, `THIRD-PARTY-NOTICES.md`, den Ordner `licenses/` und eine Verknüpfung `Quellcode.url` zu diesem Tag (`v2.11.13`) in den Programmordner. Gebaut mit CPython 3.14.0, PyInstaller 6.17.0 und Inno Setup 6.7.3 (Pakete wie `build-constraints.txt`); der Bytecode der EXE-Dateien entspricht diesem Quellstand (Vergleich wie unten).
 
-#### Tag `v2.11.12.1` – ausgelieferter Stand (Sicherheits-Hotfix)
+Neu gegenüber `v2.11.12.1` (Auswahl): Flüge werden nach einem Absturz oder Neustart von MSFS oder des MiniClients wiederhergestellt („Flug fortsetzen?“ mit „Zur letzten Position“), kein lokaler Teleport-Abbruch mehr (der Server entscheidet), ein gespeichertes Flugende geht nie verloren (auch nicht bei „Abbrechen“ ohne Serververbindung), Anmeldung wird regelmäßig verlängert, Vergleichscode beim Koppeln mit der Website, Website-Befehle laufen in einem eigenen Thread, die Verbindung zur Website verbindet sich nach einer Ablehnung nicht mehr in einer Schleife neu, ungültige Höhenwerte werden als „unbekannt“ gesendet.
+
+#### Tag `v2.11.12.1` – früher ausgelieferter Stand (Sicherheits-Hotfix)
 
 | Programm | Version | Build | Quellstand |
 |---|---|---|---|
@@ -74,7 +76,7 @@ build_exe.bat          & rem dist\FlyConomyClient.exe      (voller Client, einge
 - Jede `build_*.bat` installiert die nötigen Pakete (ohne `-c build-constraints.txt`; wer vorher wie oben installiert, bekommt die Versionen der ausgelieferten Builds) und ruft `python -m PyInstaller --noconfirm --clean <name>.spec` auf. Danach baut sie mit `ISCC.exe` das Setup (`*.iss`), wenn Inno Setup unter `Program Files` gefunden wird. Die Specs holen `SimConnect.dll` aus dem installierten Paket `SimConnect`.
 - **Browser inApp:** Ausgeliefert wird das EXE selbst. Die Datei `FlyConomyWebApp_Setup.exe` auf flyconomy.de ist `dist\FlyConomyWebApp.exe` unter anderem Namen, kein Inno-Setup.
 - **Voller Client:** `build_exe.bat` baut ihn aus dem jeweiligen Stand. EXE und Setup tragen dabei weiter die Versionsangabe 2.11.4 (`file_version_info_client.txt`, `FlyConomyClient_Setup.iss`), obwohl der Code neuer ist.
-- **Ausgelieferter Stand:** `git checkout v2.11.12.1` holt den Quellstand der aktuell ausgelieferten Programme.
+- **Ausgelieferter Stand:** `git checkout v2.11.13` holt den Quellstand der aktuell ausgelieferten Programme (MiniClient 2.11.13, Updater 1.0.7); `git checkout v2.11.12.1` den der Version davor.
 - **Genaue Nachbildung:** In der Build-Umgebung der ausgelieferten Programme lagen zusätzlich numpy, cryptography, bcrypt und psutil; PyInstaller hat sie mit eingepackt. Wer die EXE-Dateien genau nachbilden will, installiert sie zusätzlich: `python -m pip install numpy cryptography bcrypt psutil -c build-constraints.txt`.
 - **`ui/phone/`** ist eine Kopie aus der nicht veröffentlichten Panel-Quelle. Änderungen bitte direkt in `ui/phone/` machen. `_build_phone_html.py` ist veraltet: Es liest die Panel-Quelle aus `../msfs-addon` (nicht in diesem Repository) und erzeugt nicht mehr genau die enthaltene `ui/phone/index.html`.
 
@@ -129,8 +131,8 @@ The **FlyConomy server, website, database and operations** are **not** part of t
 
 Branch `main` is the development state. Every distributed version gets a tag `v<version>`; only tagged states correspond to distributed programs. The version currently offered is shown on [flyconomy.de/downloads](https://flyconomy.de/downloads). Please always use the current version; older versions receive no bug or security fixes.
 
-- **Branch `main`:** MiniClient 2.11.13, Updater 1.0.6 (no longer installs the full client), Browser inApp 1.0.1 (unchanged), panel copy 1.4.31; full client discontinued and no longer offered. From this state on, the setups of MiniClient, Updater and full client also install `LICENSE.txt`, `THIRD-PARTY-NOTICES.md`, the `licenses/` folder and a `Quellcode.url` shortcut to the source of their version (tag `v<version>`) into the program folder.
-- **Tag `v2.11.12.1` – currently distributed (security hotfix):** MiniClient 2.11.12.1 (built 2026-10-16), Updater 1.0.5 (2026-08-30, setup repackaged 2026-10-16), Browser inApp 1.0.1 (2026-08-22), panel copy 1.4.30. These setups install the license files. `v2.11.12.1` is a security hotfix on top of the 2.11.12 source distributed from 2026-08-30: the local bridge `http://127.0.0.1:17474` now answers browser requests only from the MSFS panel, the client's own pages and local programs, refuses other websites, and no longer returns the login token over HTTP; only the bridge changed (bytecode comparison). The earlier 2.11.12 is no longer offered. Full client 2.11.4 (2026-08-19): source not kept, no longer offered (see below).
+- **Tag `v2.11.13` and branch `main` – currently distributed (mandatory update for everyone):** MiniClient 2.11.13 (built 2026-10-16; older MiniClients can no longer start flights), Updater 1.0.7 (built 2026-10-16; checks every download against the SHA-256 published on flyconomy.de, no longer installs the full client), Browser inApp 1.0.1 (unchanged), panel copy 1.4.31; full client discontinued. The setups install `LICENSE.txt`, `THIRD-PARTY-NOTICES.md`, the `licenses/` folder and a `Quellcode.url` shortcut to tag `v2.11.13`. Built with CPython 3.14.0, PyInstaller 6.17.0 and Inno Setup 6.7.3; the bytecode of the executables matches this source. New since `v2.11.12.1` (selection): flights are restored after an MSFS or MiniClient crash/restart ("continue flight?" with "back to last position"), no local teleport abort any more (the server decides), a stored landing is never lost (not even on "cancel" without a server connection), the sign-in is renewed regularly, a comparison code when pairing with the website, website commands run in their own thread, the website connection no longer reconnects in a loop after a rejection, invalid altitude values are sent as unknown.
+- **Tag `v2.11.12.1` – previously distributed (security hotfix):** MiniClient 2.11.12.1 (built 2026-10-16), Updater 1.0.5 (2026-08-30, setup repackaged 2026-10-16), Browser inApp 1.0.1 (2026-08-22), panel copy 1.4.30. These setups install the license files. `v2.11.12.1` is a security hotfix on top of the 2.11.12 source distributed from 2026-08-30: the local bridge `http://127.0.0.1:17474` now answers browser requests only from the MSFS panel, the client's own pages and local programs, refuses other websites, and no longer returns the login token over HTTP; only the bridge changed (bytecode comparison). The earlier 2.11.12 is no longer offered. Full client 2.11.4 (2026-08-19): source not kept, no longer offered (see below).
 
 **How this was verified:** every Python file was compiled with CPython 3.14.0 (the version inside the executables) and compared with the modules inside the distributed executables (bytecode, constants, names and line tables). The MiniClient 2.11.12.1 executable contains exactly the `v2.11.12.1` source; compared with the previously distributed 2.11.12 only `flyconomy_client.py` differs (and there only the bridge). The bundled files (`ui/`, icons, logos) and the version resources match as well, except for line endings: some text files under `ui/` are stored with Windows line endings (CRLF) inside the executables, while the repository stores all text files with LF; a Windows clone may check them out with CRLF depending on `core.autocrlf`. The SHA-256 hashes of the setups on flyconomy.de match the build outputs. The Inno Setup packages themselves were not unpacked.
 
@@ -147,7 +149,7 @@ Requirements: Windows 10/11 (64 bit), Python 3.14 (64 bit; the distributed progr
 
 - **Browser inApp** is distributed as the bare executable: `FlyConomyWebApp_Setup.exe` on flyconomy.de is `dist\FlyConomyWebApp.exe` under another name, not an Inno setup.
 - **Full client:** `build_exe.bat` builds it from either state; the executable and setup still carry the version label 2.11.4 (`file_version_info_client.txt`, `FlyConomyClient_Setup.iss`) although the code is newer.
-- **Distributed state:** `git checkout v2.11.12.1` gets the source of the programs currently distributed.
+- **Distributed state:** `git checkout v2.11.13` gets the source of the programs currently distributed (MiniClient 2.11.13, Updater 1.0.7); `git checkout v2.11.12.1` the previous one.
 - **Exact rebuild:** the build environment of the distributed programs also contained numpy, cryptography, bcrypt and psutil, which PyInstaller bundled. To reproduce the executables exactly, also run `python -m pip install numpy cryptography bcrypt psutil -c build-constraints.txt`.
 - **`ui/phone/`** is copied from the unpublished panel source; edit the files in `ui/phone/` directly. `_build_phone_html.py` is outdated: it reads the panel source from `../msfs-addon` (not in this repository) and no longer produces exactly the included `ui/phone/index.html`.
 

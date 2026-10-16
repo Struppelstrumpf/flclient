@@ -26,6 +26,34 @@ OP_PING = 0x9
 OP_PONG = 0xA
 MAX_FRAME = 65536
 
+# RL-C04 (release-2): reconnect pacing. Before, a session the server closed (e.g. 4003
+# "invalid token" after logging out on the website) ended "normally" and the client reconnected
+# at once – 1,210 connections in 5 s in the bug hunt.
+BACKOFF_MAX_SEC = 30.0
+BUSY_MIN_SEC = 30.0  # 1013 (server busy / auth unavailable), 4004 (replaced by a 2nd instance)
+STABLE_SESSION_SEC = 60.0  # a session shorter than this counts like an error
+UNAUTHORIZED_RETRY_SEC = 15 * 60.0  # 4003: wait for a new token, retry the old one after 15 min
+
+
+def reconnect_plan(
+    hello_ok: bool, close_code: Optional[int], session_sec: float, delay: float
+) -> tuple[float, float, bool]:
+    """(wait seconds before the next connect without jitter, next delay, block this token).
+
+    - 4003 before hello_ok: the token is not accepted – wait for a NEW token (15 min at most);
+    - 1013 / 4004: at least 30 s;
+    - closed before hello_ok, any error, or a session shorter than 60 s: growing wait 1 → 2 → 4 … 30 s;
+    - a stable session (hello_ok, ≥ 60 s) that ends: 1 s, delay starts again at 1 s.
+    """
+    delay = max(1.0, float(delay or 1.0))
+    if close_code == 4003 and not hello_ok:
+        return UNAUTHORIZED_RETRY_SEC, 1.0, True
+    if close_code in (1013, 4004):
+        return max(BUSY_MIN_SEC, min(BACKOFF_MAX_SEC * 2, delay)), min(BACKOFF_MAX_SEC * 2, delay * 2), False
+    if hello_ok and session_sec >= STABLE_SESSION_SEC:
+        return 1.0, 1.0, False
+    return min(BACKOFF_MAX_SEC, delay), min(BACKOFF_MAX_SEC, delay * 2), False
+
 
 DEFAULT_API_URL = "https://flyconomy.de/api"
 
@@ -64,6 +92,12 @@ class ClientGateway:
         self.log: Callable[[str], None] = lambda _m: None
         self._last_presence = ""
         self._last_presence_at = 0.0
+        # RL-C04: outcome of the last session (read by _run, also after an exception)
+        self._hello_ok = False
+        self._close_code: Optional[int] = None
+        self._blocked_token = ""
+        self._blocked_until = 0.0
+        self.sessions = 0  # connection attempts (tests, diagnostics)
 
     @property
     def connected(self) -> bool:
@@ -120,20 +154,37 @@ class ClientGateway:
         while not self._stop.is_set():
             token = (self.token_provider() if self.token_provider else "") or ""
             if not token:
-                time.sleep(2.0)
+                self._stop.wait(2.0)
                 continue
+            if self._blocked_token and token == self._blocked_token and time.time() < self._blocked_until:
+                # RL-C04: the server refused this token (4003) – wait for a new login.
+                self._stop.wait(2.0)
+                continue
+            self._blocked_token = ""
+            started = time.time()
+            self._hello_ok = False
+            self._close_code = None
+            self.sessions += 1
+            why = ""
             try:
                 self._session()
-                delay = 1.0
             except Exception as e:
-                jitter = random.random() * 3.0
-                wait = min(30.0, delay) + jitter
-                self.log(f"Gateway: reconnect in {wait:.0f}s ({e})")
-                self._stop.wait(wait)
-                delay = min(30.0, delay * 2)
+                why = str(e)
             finally:
                 self._connected = False
                 self._close()
+            wait, delay, block = reconnect_plan(self._hello_ok, self._close_code, time.time() - started, delay)
+            if block:
+                self._blocked_token = token
+                self._blocked_until = time.time() + wait
+                self.log("Gateway: Anmeldung abgelehnt – neue Verbindung erst nach einem neuen Login.")
+                continue
+            wait += random.random() * (3.0 if wait > 1.0 else 1.0)
+            if self._close_code is not None and not why:
+                why = f"close {self._close_code}"
+            if wait > 2.0 or why:
+                self.log(f"Gateway: reconnect in {wait:.0f}s ({why or 'getrennt'})")
+            self._stop.wait(wait)
 
     def _session(self) -> None:
         self._connected = False
@@ -170,6 +221,8 @@ class ClientGateway:
         head, rest = buf.split(b"\r\n\r\n", 1)
         status = head.split(b"\r\n", 1)[0]
         if b" 101 " not in status:
+            if b" 429 " in status or b" 503 " in status:
+                self._close_code = 1013  # the server asks to slow down (RL-C04): at least 30 s
             raise RuntimeError(f"gateway handshake {status.decode('latin1', 'replace')[:80]}")
         expected = base64.b64encode(
             hashlib.sha1((key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11").encode("ascii")).digest()
@@ -211,6 +264,8 @@ class ClientGateway:
                 raise RuntimeError("gateway closed")
             opcode, payload = frame
             if opcode == OP_CLOSE:
+                if len(payload) >= 2:
+                    self._close_code = struct.unpack("!H", payload[:2])[0]
                 break
             if opcode == OP_PING:
                 self._send_frame(OP_PONG, payload)
@@ -226,6 +281,7 @@ class ClientGateway:
             kind = str(msg.get("type") or "")
             if kind == "hello_ok":
                 hello_ok = True
+                self._hello_ok = True
                 self._connected = True
                 self.log("Gateway verbunden")
                 self.maybe_presence(force=True)

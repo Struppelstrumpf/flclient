@@ -1,6 +1,6 @@
 ; FlyConomy Updater – Installer (Inno Setup 6)
 #define MyAppName "FlyConomy Updater"
-#define MyAppVersion "1.0.6"
+#define MyAppVersion "1.0.7"
 #define MyAppPublisher "FlyConomy"
 #define MyAppURL "https://flyconomy.de"
 ; Source of exactly this setup (AGPL 6 d): the tag of the client release it ships with (update at release)

@@ -79,6 +79,12 @@ UPDATER_PUSH_FALLBACK = "1.0.5"
 PANEL_PKG_NAME = "flyconomy-ingame-panel"
 # Panel 1.4.31+ asks twice before /cancel; older panels get a Windows question.
 PANEL_TWO_TAP_CANCEL = "1.4.31"
+# E-51 (release-2): a login is valid 90 days from its last use. The client renews it at
+# start (/auth/me), before start and landing, every ~10 min with the sim and - new - at
+# least every 12 h while it runs in the tray. A warning only when renewing keeps failing.
+SESSION_REFRESH_SEC = 12 * 3600
+SESSION_RETRY_SEC = 30 * 60
+SESSION_WARN_SEC = 7 * 86400
 
 BRIDGE_HOST = "127.0.0.1"
 BRIDGE_PORT = 17474
@@ -995,14 +1001,19 @@ class SimReader:
             lon = float(point["longitude"])
         except (KeyError, TypeError, ValueError):
             return False
-        alt = _finite(point.get("altitude"))
+        alt_raw = point.get("altitude")
+        alt = _finite(alt_raw)
         hdg = point.get("heading")
         gs = _finite(point.get("ground_speed"))
         on_ground = bool(point.get("on_ground"))
+        # RL-F13: without a usable altitude (None / 0 in the air) keep the sim's altitude
+        # instead of putting the aircraft to 0 ft.
+        keep_alt = (alt_raw is None or abs(alt) < 0.5) and not on_ground
         with self._io:
             ok = self._set("PLANE_LATITUDE", lat, force=True)
             ok = self._set("PLANE_LONGITUDE", lon, force=True) and ok
-            ok = self._set("PLANE_ALTITUDE", alt, force=True) and ok
+            if not keep_alt:
+                ok = self._set("PLANE_ALTITUDE", alt, force=True) and ok
             if hdg is not None:
                 self._set("PLANE_HEADING_DEGREES_TRUE", math.radians(_finite(hdg)), force=True)
             if not on_ground and gs > 30:
@@ -1811,6 +1822,22 @@ class SimReader:
             return None
 
 
+def parse_iso_epoch(raw: Any) -> Optional[float]:
+    """ISO time (e.g. 2027-01-14T08:00:00.000Z) → epoch seconds; None for null/unreadable."""
+    if raw in (None, ""):
+        return None
+    try:
+        text = str(raw).strip()
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 def _retry_after_of(r: Any, body: Any, default: int = RETRY_INTERVAL_SEC) -> int:
     raw = None
     if isinstance(body, dict):
@@ -1835,6 +1862,15 @@ class FlyConomyAPI:
         # One door for every HTTP call: measures the server clock (D5) and lets
         # tests replace the network with a fake server.
         self.transport = requests.request
+        # E-51: end of the login (epoch s, from token_expires_at; None = server without expiry),
+        # last successful renewal, and "token_expired"/"session_revoked" after the server said so
+        # for THIS token (no retry loop until a new login brings another token).
+        self.token_expires_at: Optional[float] = None
+        self.last_refresh_ok_at: float = 0.0
+        self.session_problem: str = ""
+        self._session_problem_token: str = ""
+        # E-49: the account's live-map choice (None = unknown / never asked).
+        self.share_live_position: Optional[bool] = None
 
     def _req(self, method: str, url: str, **kwargs: Any) -> Any:
         t0 = time.time()
@@ -1867,14 +1903,34 @@ class FlyConomyAPI:
         token = (token or "").strip()
         if token.count(".") < 2 or len(token) < 40:
             return
+        if token != self._session_problem_token:
+            self.session_problem = ""
         self.token = token
         if user:
             self.user = user
         name = str((self.user or {}).get("name") or "")
         self.config.set_access_token(token, name)
 
+    def _note_session_answer(self, data: Any) -> None:
+        """E-51: /auth/me and /auth/refresh tell when this login ends (token_expires_at)."""
+        if not isinstance(data, dict) or "token_expires_at" not in data:
+            return
+        self.token_expires_at = parse_iso_epoch(data.get("token_expires_at"))
+
+    def _note_session_problem(self, r: Any) -> str:
+        """401 token_expired / session_revoked: remember it for THIS token (no retry loop)."""
+        try:
+            body = r.json() if r.content else {}
+        except Exception:
+            body = {}
+        code = str((body or {}).get("code") or "") if isinstance(body, dict) else ""
+        if r.status_code in (401, 403) and code in ("token_expired", "session_revoked"):
+            self.session_problem = code
+            self._session_problem_token = self._token()
+        return code
+
     def refresh_session(self) -> bool:
-        """Pull a fresh JWT. Old/expired signatures still work on the server."""
+        """Pull a fresh JWT (E-51: renews the 90-day login). False = not renewed."""
         if not self._token():
             return False
         try:
@@ -1883,12 +1939,17 @@ class FlyConomyAPI:
                 headers=self._headers(),
                 timeout=12,
             )
+            if r.status_code in (401, 403):
+                self._note_session_problem(r)
+                return False
             if r.status_code != 200:
                 return False
             data = r.json() if r.content else {}
+            self._note_session_answer(data)
             new = str(data.get("token") or "").strip()
             if new.count(".") >= 2:
                 self._store_session(new, data.get("user") if isinstance(data.get("user"), dict) else None)
+                self.last_refresh_ok_at = time.time()
                 return True
             return False
         except Exception:
@@ -1911,18 +1972,27 @@ class FlyConomyAPI:
                 timeout=15,
             )
             if r.status_code != 200:
+                code = self._note_session_problem(r)
                 self.token = previous or None
+                if code == "token_expired":
+                    return False, t_ui(
+                        "Anmeldung abgelaufen – bitte im MiniClient neu mit Discord anmelden.",
+                        "Sign-in expired – please sign in again with Discord in the MiniClient.",
+                    )
                 return False, r.json().get("error", r.text[:200])
             data = r.json()
             self.user = data.get("user")
             name = (self.user or {}).get("name") or "pilot"
             fresh = str(data.get("token") or token).strip()
+            self._note_session_answer(data)
             self._store_session(fresh, self.user)
+            self.last_refresh_ok_at = time.time()
             try:
                 prefs = self.get_preferences()
                 loc = str(prefs.get("locale") or "").strip().lower()
                 if loc in ("de", "en"):
                     self.config.set_locale(loc)
+                self.note_preferences(prefs)
             except Exception:
                 pass
             try:
@@ -2193,13 +2263,25 @@ class FlyConomyAPI:
         return data
 
     def cancel_flight(self, reason: str = "") -> dict:
-        r = self._req("POST",
-            f"{self.config.api_url}/flights/cancel",
-            json={"reason": (reason or "")[:300]},
-            headers=self._headers(),
-            timeout=15,
-        )
-        return r.json()
+        """POST /flights/cancel. The answer carries "_status" (RL-C05: only a 200 or "no active
+        flight" may clear the local flight). A network error raises RetryableError."""
+        try:
+            r = self._req("POST",
+                f"{self.config.api_url}/flights/cancel",
+                json={"reason": (reason or "")[:300]},
+                headers=self._headers(),
+                timeout=15,
+            )
+        except requests.RequestException as e:
+            raise RetryableError(f"Server nicht erreichbar: {e}") from e
+        try:
+            data = r.json() if r.content else {}
+        except Exception:
+            data = {}
+        if not isinstance(data, dict):
+            data = {"error": str(data)[:200]}
+        data["_status"] = int(getattr(r, "status_code", 0) or 0)
+        return data
 
     def get_preferences(self) -> dict:
         r = self._req("GET",
@@ -2209,6 +2291,13 @@ class FlyConomyAPI:
         )
         r.raise_for_status()
         return r.json()
+
+    def note_preferences(self, prefs: Any) -> None:
+        """E-49: remember the live-map choice of the account (shown in the panel/tray texts)."""
+        if not isinstance(prefs, dict):
+            return
+        val = prefs.get("shareLivePosition", prefs.get("share_live_position"))
+        self.share_live_position = val if isinstance(val, bool) else None
 
     def set_preferences(self, share_live_position: bool) -> dict:
         r = self._req("PUT",
@@ -2521,8 +2610,13 @@ class AppState:
                 },
                 "api_url": self.config.api_url,
                 "bridge": f"http://{BRIDGE_HOST}:{BRIDGE_PORT}",
-                "share_live_position": False,
+                "share_live_position": self.api.share_live_position is True,
+                "live_map": live_map_info(),
                 "needs_onboarding": False,
+                # E-51 / RL-F02 (release-2)
+                "session_expires_at": self.api.token_expires_at,
+                "session_problem": self.api.session_problem or "",
+                "claim_code": claim_code_now(),
                 "track_points_local": len(self.local_track) if self.monitoring else 0,
                 "mode": "end_of_flight",
                 "pending_end": bool(self.pending_end),
@@ -4819,7 +4913,102 @@ def retry_loop() -> None:
                 flush_pending_start()
         except Exception as e:
             STATE.last_error = str(e)
+        try:
+            session_keepalive_tick()
+        except Exception as e:
+            STATE.log_only(f"Login-Erneuerung: {e}")
         time.sleep(5)
+
+
+_SESSION_KEEP: Dict[str, Any] = {"next_try": 0.0, "warned_at": 0.0, "problem_noted": ""}
+
+
+def session_keepalive_tick(now: Optional[float] = None) -> str:
+    """E-51: renew the login at least every 12 h, even without MSFS (the MiniClient sits in the
+    tray for days). Returns what happened (for tests): idle / renewed / failed / expired / warned.
+
+    - token_expired / session_revoked from the server = no retries with this token (one notice);
+      a new Discord login brings a new token and the renewal starts again,
+    - any other failure (network, 5xx) = next try in 30 min, never a busy loop,
+    - less than 7 days left (renewal kept failing) = one notice per day: please sign in again.
+      A running flight is never touched here."""
+    api = STATE.api
+    tok = api._token()
+    if not tok:
+        return "idle"
+    now = time.time() if now is None else float(now)
+    if api.session_problem and api._session_problem_token == tok:
+        if _SESSION_KEEP.get("problem_noted") != tok[-16:]:
+            _SESSION_KEEP["problem_noted"] = tok[-16:]
+            msg = t_ui(
+                "Deine Anmeldung ist abgelaufen. Bitte im MiniClient-Tray „Discord / Login“ wählen und neu "
+                "mit Discord anmelden. Ein laufender Flug bleibt aktiv und kann danach gelandet werden.",
+                "Your sign-in has expired. Please choose “Discord / Login” in the MiniClient tray and sign "
+                "in again. A running flight stays active and can be landed afterwards.",
+            )
+            STATE.log(msg)
+            notify_windows(t_ui("FlyConomy – bitte neu anmelden", "FlyConomy – please sign in again"), msg,
+                           code="FC-LOGIN-EXPIRED", kind="info")
+        return "expired"
+    result = "idle"
+    due = now - float(api.last_refresh_ok_at or 0) >= SESSION_REFRESH_SEC
+    if due and now >= float(_SESSION_KEEP.get("next_try") or 0):
+        if api.refresh_session():
+            result = "renewed"
+            _SESSION_KEEP["next_try"] = 0.0
+        elif api.session_problem:
+            return session_keepalive_tick(now)
+        else:
+            result = "failed"
+            _SESSION_KEEP["next_try"] = now + SESSION_RETRY_SEC
+    exp = api.token_expires_at
+    if exp and exp - now < SESSION_WARN_SEC and now - float(_SESSION_KEEP.get("warned_at") or 0) >= 86400:
+        _SESSION_KEEP["warned_at"] = now
+        days = max(0, int((exp - now) // 86400))
+        msg = t_ui(
+            f"Deine Anmeldung läuft in {days} Tag(en) ab und konnte nicht automatisch verlängert werden. "
+            "Bitte bald im MiniClient-Tray „Discord / Login“ neu anmelden.",
+            f"Your sign-in ends in {days} day(s) and could not be renewed automatically. "
+            "Please sign in again soon via “Discord / Login” in the MiniClient tray.",
+        )
+        STATE.log(msg)
+        notify_windows(t_ui("FlyConomy – bitte bald neu anmelden", "FlyConomy – please sign in again soon"), msg,
+                       code="FC-LOGIN-SOON", kind="info")
+        result = "warned"
+    return result
+
+
+def public_user(user: Any) -> Optional[dict]:
+    """RL-C03: the user as the bridge may show it (no e-mail, Discord ids or tokens)."""
+    if not isinstance(user, dict):
+        return None
+    keep = ("id", "name", "level", "pro_tier", "pro_expires_at", "avatar_url")
+    return {k: user.get(k) for k in keep if k in user}
+
+
+LIVE_MAP_SETTINGS_URL = f"{SITE_URL}/settings"
+
+
+def live_map_info() -> dict:
+    """E-49 (release-2): the live map shows a pilot only with consent (website settings)."""
+    visible = STATE.api.share_live_position is True
+    if visible:
+        text = t_ui(
+            "Live-Karte: Du bist während deiner Flüge öffentlich sichtbar (Name, Flugzeug, Route, Position). "
+            "Ändern kannst du das jederzeit auf flyconomy.de unter Einstellungen.",
+            "Live map: you are publicly visible during your flights (name, aircraft, route, position). "
+            "You can change this any time on flyconomy.de under Settings.",
+        )
+    else:
+        text = t_ui(
+            "Live-Karte: Du fliegst unsichtbar. Öffentlich sichtbar wirst du nur mit deiner Zustimmung "
+            "(flyconomy.de → Einstellungen: „Auf der Live-Karte sichtbar“). Für die Prüfung und Bezahlung "
+            "deiner Flüge nutzt FlyConomy deine Position trotzdem.",
+            "Live map: you fly invisibly. You only become publicly visible with your consent "
+            "(flyconomy.de → Settings: “Visible on the live map”). FlyConomy still uses your position "
+            "to validate and pay your flights.",
+        )
+    return {"visible": visible, "text": text, "settings_url": LIVE_MAP_SETTINGS_URL}
 
 
 def _finite(val: Any, default: float = 0.0) -> float:
@@ -4852,6 +5041,27 @@ def _heading_deg(val: Any) -> float:
     return (h + 360.0) % 360.0
 
 
+def sample_altitude(raw: dict) -> Optional[float]:
+    """RL-F13: PLANE ALTITUDE as sent to the server, None when SimConnect gave nothing usable.
+
+    Live 1,188 airborne track points (> 50 kt) carried exactly 0 ft – a failed read, not a
+    real altitude (the profile and the stream overlay jumped to 0). None goes out as null
+    (the server stores NULL; signatures treat it like 0 on both sides, as before)."""
+    v = raw.get("altitude")
+    try:
+        alt = float(v) if v is not None else None
+    except (TypeError, ValueError):
+        alt = None
+    if alt is None or not math.isfinite(alt):
+        return None
+    gs = _finite(raw.get("ground_speed"))
+    agl = _agl_from(raw.get("alt_agl"))
+    airborne = not bool(raw.get("on_ground")) and gs > 50.0
+    if abs(alt) < 0.5 and airborne and (agl is None or agl > 50.0):
+        return None
+    return alt
+
+
 def make_sample(raw: dict) -> dict:
     rate = _finite(raw.get("simulation_rate"), 1.0)
     if rate <= 0:
@@ -4861,7 +5071,7 @@ def make_sample(raw: dict) -> dict:
     sample = {
         "latitude": _finite(raw["latitude"]),
         "longitude": _finite(raw["longitude"]),
-        "altitude": _finite(raw.get("altitude")),
+        "altitude": sample_altitude(raw),
         "ground_speed": max(0.0, _finite(raw.get("ground_speed"))),
         "heading": _heading_deg(raw.get("heading")),
         "fuel_total": max(0.0, _finite(fuel_raw)) if fuel_raw is not None else None,
@@ -5967,6 +6177,29 @@ def _action_end(*, notify: bool, persist_retry: bool) -> dict:
         STATE.sim_io_pause = False
 
 
+def cancel_confirmed(result: Any) -> bool:
+    """RL-C05: the server cancelled the flight (200) or has none open ("Kein aktiver Flug")."""
+    if not isinstance(result, dict):
+        return False
+    status = int(result.get("_status") or 0)
+    if status == 200:
+        return True
+    err = str(result.get("error") or "").lower()
+    return status in (400, 404) and ("kein aktiver flug" in err or "no active flight" in err)
+
+
+def _local_flight_open() -> bool:
+    """Something of a flight lives here: a running/restored session, a stored landing or a file."""
+    return bool(
+        STATE.active_flight_id
+        or STATE.session_key
+        or STATE.monitoring
+        or STATE.pending_end
+        or file_or_bak_exists(PENDING_END_PATH)
+        or file_or_bak_exists(FLIGHT_SESSION_PATH)
+    )
+
+
 def action_cancel() -> dict:
     result: dict = {}
     try:
@@ -5985,6 +6218,19 @@ def action_cancel() -> dict:
         )
         STATE.log(msg)
         return {"ok": False, "code": "END_BUSY", "error": msg, "flight_id": result.get("flight_id")}
+    if not cancel_confirmed(result) and _local_flight_open():
+        # RL-C05: no answer / 5xx / 401 – the flight may still be open on the server and a
+        # landing may be stored here. Keep everything (session, stored end); before, both were
+        # thrown away and the pilot lost an already flown landing.
+        msg = t_ui(
+            "Abbrechen hat der Server nicht bestätigt (keine Verbindung oder Anmeldung abgelaufen). "
+            "Der Flug und ein gespeichertes Flugende bleiben erhalten – bitte später erneut versuchen "
+            "oder auf der Website unter „Flüge“ nachsehen.",
+            "The server did not confirm the cancel (no connection or sign-in expired). The flight "
+            "and a stored landing are kept – please try again later or check “Flights” on the website.",
+        )
+        STATE.log(f"{msg} ({str(result.get('error') or result.get('_status') or '')[:120]})")
+        return {"ok": False, "code": "CANCEL_UNCONFIRMED", "error": msg}
     key = current_end_session_key()
     record = pending_end_for(STATE.active_flight_id, key or STATE.session_key)
     # Review S8: remembered first, so a flush that is sending right now can never
@@ -5998,9 +6244,11 @@ def action_cancel() -> dict:
     _clear_flight_runtime()
     STATE.set_ui_status("Bereit", "Ready")
     STATE.log("Flug abgebrochen / Client-Session bereinigt")
-    if result.get("error") and "no" in str(result.get("error")).lower():
+    if int((result or {}).get("_status") or 0) != 200:
+        # "Kein aktiver Flug" from the server, or nothing of a flight here: only local leftovers
         return {"ok": True, "message": "Client-Session bereinigt (kein Server-Flug)"}
-    return result or {"ok": True, "message": "Flug abgebrochen"}
+    out = {k: v for k, v in result.items() if k != "_status"}
+    return out or {"ok": True, "message": "Flug abgebrochen"}
 
 
 def action_request_livery() -> dict:
@@ -6807,7 +7055,14 @@ def execute_gateway_command(cmd: dict, start_result: Optional[tuple] = None) -> 
             return start_result
         if action == "cancel":
             data = action_cancel()
-            GATEWAY.send_result(cmd_id, ok=True, data=data)
+            # RL-C05: an unconfirmed cancel (or END_BUSY) is not "ok" for the website.
+            done = not (isinstance(data, dict) and data.get("ok") is False)
+            GATEWAY.send_result(
+                cmd_id,
+                ok=done,
+                data=data,
+                error=None if done else str((data or {}).get("error") or "cancel_unconfirmed"),
+            )
             return start_result
         if action == "connect_sim":
             ok, msg = STATE.sim.connect()
@@ -6859,8 +7114,8 @@ def execute_gateway_command(cmd: dict, start_result: Optional[tuple] = None) -> 
         return start_result
 
 
-def drain_gateway_commands() -> None:
-    items: list[dict] = []
+def drain_gateway_commands(first: Optional[dict] = None) -> None:
+    items: list[dict] = [first] if isinstance(first, dict) else []
     while True:
         try:
             items.append(STATE.cmd_queue.get_nowait())
@@ -6882,6 +7137,37 @@ def drain_gateway_commands() -> None:
             GATEWAY.send_result(str(cmd.get("id") or ""), ok=ok, data=data, error=err)
         else:
             GATEWAY.send_result(str(cmd.get("id") or ""), ok=True, data={"ok": True, "coalesced": True})
+
+
+_GW_WORKER: Dict[str, Any] = {"thread": None}
+
+
+def gateway_command_worker() -> None:
+    """RL-C06 (D13): website commands run in their own thread. Before, the 1-Hz monitor loop
+    executed them – a slow start (HTTP up to 20 s, loading the aircraft) stopped the flight
+    monitoring and the gateway reads for that time."""
+    while True:
+        try:
+            first = STATE.cmd_queue.get(timeout=1.0)
+        except queue.Empty:
+            continue
+        try:
+            drain_gateway_commands(first)
+        except Exception as e:
+            STATE.log_only(f"Gateway-Befehl: {e}")
+
+
+def gateway_worker_alive() -> bool:
+    t = _GW_WORKER.get("thread")
+    return bool(t is not None and t.is_alive())
+
+
+def ensure_gateway_worker() -> None:
+    if gateway_worker_alive():
+        return
+    t = threading.Thread(target=gateway_command_worker, daemon=True, name="fc-gw-cmd")
+    _GW_WORKER["thread"] = t
+    t.start()
 
 
 def gateway_presence() -> dict:
@@ -6936,6 +7222,7 @@ def ensure_gateway() -> None:
     GATEWAY.presence_provider = gateway_presence
     GATEWAY.on_command = enqueue_gateway_command
     GATEWAY.log = STATE.log
+    ensure_gateway_worker()
     GATEWAY.start()
 
 
@@ -6951,11 +7238,13 @@ def after_login_sync() -> None:
 def start_discord_claim_login() -> dict:
     nonce = secrets.token_hex(32)
     begin_url = f"{DEFAULT_API_URL}/client/claim/begin"
+    # RL-F02 part 2: ask for a 6-digit comparison code (a server without the feature ignores
+    # the field and sends none – then the login works as before).
     try:
-        r = requests.put(begin_url, json={"nonce": nonce}, timeout=10)
+        r = requests.put(begin_url, json={"nonce": nonce, "want_code": True}, timeout=10)
         if r.status_code == 409:
             nonce = secrets.token_hex(32)
-            r = requests.put(begin_url, json={"nonce": nonce}, timeout=10)
+            r = requests.put(begin_url, json={"nonce": nonce, "want_code": True}, timeout=10)
         if r.status_code == 503:
             raise RuntimeError("Login-Gateway nicht erreichbar – bestehendes Token bleibt.")
         if r.status_code >= 400:
@@ -6965,11 +7254,53 @@ def start_discord_claim_login() -> dict:
         STATE.log(f"Claim-Login: {msg}")
         notify_windows(t_ui("FlyConomy – Login", "FlyConomy – Login"), msg, code="FC-LOGIN", kind="error")
         return {"ok": False, "error": msg}
+    code = ""
+    try:
+        code = str(((r.json() if r.content else {}) or {}).get("code") or "").strip()
+    except Exception:
+        code = ""
+    set_claim_code(code if re.fullmatch(r"\d{6}", code) else "", CLAIM_WAIT_SEC)
     url = f"{SITE_URL}/api/auth/discord/start?next=/client-login&fc_nonce={nonce}"
     webbrowser.open(url)
     STATE.log("Website-Login geöffnet – Discord bestätigt den MiniClient.")
+    shown = claim_code_now()
+    if shown:
+        msg = t_ui(
+            f"Die Website fragt nach diesem Code:\n\n{format_claim_code(shown)}\n\n"
+            "Nur eingeben, wenn du den MiniClient gerade selbst gestartet hast.",
+            f"The website asks for this code:\n\n{format_claim_code(shown)}\n\n"
+            "Only enter it if you just started the MiniClient yourself.",
+        )
+        STATE.log(t_ui(f"Anmelde-Code für die Website: {format_claim_code(shown)}",
+                       f"Sign-in code for the website: {format_claim_code(shown)}"))
+        notify_windows(t_ui("FlyConomy – Anmelde-Code", "FlyConomy – sign-in code"), msg, code="FC-LOGIN-CODE", kind="info")
     threading.Thread(target=wait_claim_token, args=(nonce,), daemon=True, name="fc-claim").start()
-    return {"ok": True, "url": url, "message": "Website geöffnet. Nach Discord-Login verbindet sich der Client."}
+    out = {"ok": True, "url": url, "message": "Website geöffnet. Nach Discord-Login verbindet sich der Client."}
+    if shown:
+        out["code"] = shown
+    return out
+
+
+CLAIM_WAIT_SEC = 120.0
+_CLAIM_CODE: Dict[str, Any] = {"code": "", "until": 0.0}
+
+
+def set_claim_code(code: str, ttl_sec: float) -> None:
+    _CLAIM_CODE["code"] = str(code or "")
+    _CLAIM_CODE["until"] = time.time() + float(ttl_sec) if code else 0.0
+
+
+def claim_code_now() -> str:
+    """RL-F02: the comparison code of the running browser login ('' when none / expired)."""
+    code = str(_CLAIM_CODE.get("code") or "")
+    if code and time.time() < float(_CLAIM_CODE.get("until") or 0):
+        return code
+    return ""
+
+
+def format_claim_code(code: str) -> str:
+    c = str(code or "")
+    return f"{c[:3]} {c[3:]}" if len(c) == 6 else c
 
 
 def claim_wait_pause(status: int, retry_after: Any = None) -> float:
@@ -6988,6 +7319,13 @@ def claim_wait_pause(status: int, retry_after: Any = None) -> float:
 
 
 def wait_claim_token(nonce: str, *, deadline_sec: float = 120.0) -> None:
+    try:
+        _wait_claim_token(nonce, deadline_sec=deadline_sec)
+    finally:
+        set_claim_code("", 0)  # the code is only valid for this one login
+
+
+def _wait_claim_token(nonce: str, *, deadline_sec: float = 120.0) -> None:
     deadline = time.time() + deadline_sec
     while time.time() < deadline:
         try:
@@ -7089,7 +7427,8 @@ def _ground_glitch(raw: dict) -> bool:
 
 def monitor_tick() -> None:
     """One second of the monitor: read the sim, record, check, ping, auto-end."""
-    drain_gateway_commands()
+    if not gateway_worker_alive():
+        drain_gateway_commands()  # RL-C06: only if the command thread is not there (tests, crash)
     process_ground_queue(allow_fire=not STATE.sim_io_pause)
     if STATE.sim_io_pause:
         return
@@ -7484,6 +7823,7 @@ def monitor_tick() -> None:
             loc = str(prefs.get("locale") or "").strip().lower()
             if loc in ("de", "en") and loc != STATE.config.locale:
                 STATE.config.set_locale(loc)
+            STATE.api.note_preferences(prefs)
         except Exception:
             pass
 
@@ -7954,7 +8294,8 @@ class BridgeHandler(BaseHTTPRequestHandler):
                     {
                         "ok": ok,
                         "message": msg,
-                        "user": STATE.api.user,
+                        # RL-C03: same short user as /status (no e-mail, no Discord ids).
+                        "user": public_user(STATE.api.user),
                         "needs_onboarding": False,
                         "mode": "end_of_flight",
                         "api_url": DEFAULT_API_URL,
@@ -7964,12 +8305,16 @@ class BridgeHandler(BaseHTTPRequestHandler):
                 ok, msg = STATE.sim.connect()
                 self._json(200 if ok else 400, {"ok": ok, "message": msg})
             elif path in ("/live-share", "/onboarding"):
+                # E-49: the client never switches the live map itself – the consent is given on
+                # the website (with the full text and a record); here only what is set.
+                info = live_map_info()
                 self._json(
                     200,
                     {
                         "ok": True,
-                        "message": "Live-Map vorerst deaktiviert – Prüfung nur beim Flugende.",
-                        "share_live_position": False,
+                        "message": info["text"],
+                        "share_live_position": info["visible"],
+                        "settings_url": info["settings_url"],
                     },
                 )
             elif path == "/start":
@@ -8145,16 +8490,24 @@ def flight_may_be_open() -> bool:
     return bool(flight_busy_status().get("busy"))
 
 
+def cancel_answer(result: Any) -> dict:
+    """Bridge/desktop answer of a cancel. RL-C05: an unconfirmed cancel is "ok": false with the
+    reason – the panel then shows the text instead of "Abgebrochen"."""
+    if isinstance(result, dict) and result.get("ok") is False:
+        return {"ok": False, "error": result.get("error"), "code": result.get("code"), "result": result}
+    return {"ok": True, "result": result}
+
+
 def bridge_cancel(body: dict, panel_version: str) -> dict:
     """/cancel over the bridge (D11). Panel 1.4.31+ already asked twice; any other
     caller (old panel, phone page) gets a Windows question first."""
     if not flight_may_be_open():
-        return {"ok": True, "result": action_cancel()}
+        return cancel_answer(action_cancel())
     confirmed = str((body or {}).get("confirm") or "") == "two-tap" and version_tuple(
         panel_version
     ) >= version_tuple(PANEL_TWO_TAP_CANCEL)
     if confirmed:
-        return {"ok": True, "result": action_cancel()}
+        return cancel_answer(action_cancel())
     ask_cancel_confirmation()
     return {
         "ok": True,
@@ -8524,6 +8877,8 @@ class DesktopApi:
     def cancel_flight(self) -> dict:
         try:
             result = action_cancel()
+            if isinstance(result, dict) and result.get("ok") is False:
+                return {"ok": False, "error": result.get("error"), "result": result}
             return {"ok": True, "message": "Flug abgebrochen", "result": result}
         except Exception as e:
             STATE.log(f"Abbruch fehlgeschlagen: {e}")
@@ -8677,14 +9032,23 @@ def run_mini() -> None:
     stop = threading.Event()
     tray_holder: Dict[str, Any] = {"icon": None}
 
+    login_try = {"at": 0.0}
+
     def ensure_session() -> bool:
         if STATE.api.token:
             return True
         tok = STATE.config.access_token
-        if tok:
-            ok, _msg = STATE.api.login(None, tok)
-            return bool(ok)
-        return False
+        if not tok:
+            return False
+        # E-51: an expired login is not retried every 1.5 s (only a new Discord login helps),
+        # other failures at most every 30 s.
+        if STATE.api.session_problem and tok == STATE.api._session_problem_token:
+            return False
+        if time.time() - login_try["at"] < 30.0:
+            return False
+        login_try["at"] = time.time()
+        ok, _msg = STATE.api.login(None, tok)
+        return bool(ok)
 
     def open_discord_login() -> None:
         start_discord_claim_login()
@@ -8742,7 +9106,7 @@ def run_mini() -> None:
     root = tk.Tk()
     STATE.tk_root = root
     root.title(f"FlyConomy MiniClient {CLIENT_VERSION}")
-    root.geometry("420x320")
+    root.geometry("420x360")
     root.configure(bg="#F3F8FD")
     root.resizable(False, False)
 
@@ -8794,6 +9158,16 @@ def run_mini() -> None:
     )
     btn.pack(anchor="w")
 
+    # RL-F02 part 2: the comparison code the website asks for (only while a login runs).
+    code_var = tk.StringVar(value="")
+    tk.Label(
+        frame,
+        textvariable=code_var,
+        font=("Segoe UI", 12, "bold"),
+        bg="#F3F8FD",
+        fg="#0F1B2D",
+    ).pack(anchor="w", pady=(10, 0))
+
     tk.Label(
         frame,
         text=f"Bridge http://127.0.0.1:{BRIDGE_PORT}  ·  v{CLIENT_VERSION}",
@@ -8819,6 +9193,12 @@ def run_mini() -> None:
     def tick() -> None:
         if stop.is_set():
             return
+        code = claim_code_now()
+        code_var.set(
+            t_ui(f"Code für die Website: {format_claim_code(code)}", f"Code for the website: {format_claim_code(code)}")
+            if code
+            else ""
+        )
         if ensure_session():
             user = (STATE.api.user or {}).get("name") or (STATE.api.user or {}).get(
                 "username"
