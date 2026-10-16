@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FlyConomy</title>
+  <style>
+    html, body { margin:0; background:#0e1014; overflow:hidden; height:100%; }
+    #stageOuter { margin:0 auto; }
+  </style>
+  <link rel="stylesheet" href="/phone/FlyConomyPanel.css" />
+  <script>
+    window.SimVar = { SetSimVarValue: function () { return Promise.resolve(); } };
+    window.Coherent = { call: function () {}, trigger: function () {}, on: function () {} };
+  </script>
+  <script src="/phone/FlyConomyPanel.js"></script>
+</head>
+<body class="border-box">
+<div id="stageOuter">
+        <div id="phoneChrome" class="phone-chrome">
+          <button id="btnMove" class="chrome-btn chrome-move" type="button" title="Verschieben" aria-label="Verschieben">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+              <path fill="currentColor" d="M10 4h4v4h-4V4zm6 6h4v4h-4v-4zM4 10h4v4H4v-4zm6 6h4v4h-4v-4z"/>
+            </svg>
+          </button>
+          <button id="btnClosePanel" class="chrome-btn chrome-close" type="button" title="Schließen" aria-label="Schließen">
+            <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+              <path fill="currentColor" d="M18.3 5.7 12 12l-6.3-6.3-1.4 1.4L10.6 13.4 4.3 19.7l1.4 1.4L12 14.8l6.3 6.3 1.4-1.4-6.3-6.3 6.3-6.3z"/>
+            </svg>
+          </button>
+        </div>
+        <div id="stageScale">
+        <div id="stageWrap">
+        <div id="stage" data-view="home" data-state="offline">
+          <div class="phone">
+            <div class="screen">
+              <div class="island"></div>
+
+              <header class="gx-head">
+                <div class="gx-head-copy">
+                    <div class="gx-title">FlyConomy <span id="headVer" class="gx-ver">v1.4.30</span></div>
+                  <div class="gx-sub" id="headSub">Bridge verbindet...</div>
+                </div>
+                <button id="btnLog" class="gx-ico" type="button">Log</button>
+              </header>
+
+              <div class="gx-chips" id="chipRow">
+                <span class="chip bad" id="chipBridge">Bridge</span>
+                <span class="chip" id="chipAc">-</span>
+                <span class="chip" id="chipJobs">0 Jobs</span>
+                <span class="chip" id="chipPax">0 Pax</span>
+                <span class="chip hidden" id="chipFenix">Fenix</span>
+                <span class="chip hidden" id="chipGsx">GSX</span>
+              </div>
+
+              <div id="alertBox" class="gx-alert hidden"></div>
+
+              <div class="gx-body">
+                <section id="viewHome" class="view">
+                  <div class="tile-grid">
+                    <div class="tile-cell"><button class="tile" data-go="gsx" data-key="1" type="button"><b class="n">1</b><span class="tile-ico ico-gsx"></span><span class="lab">Ground / GSX</span></button></div>
+                    <div class="tile-cell"><button class="tile" data-go="fuel" data-key="2" type="button"><b class="n">2</b><span class="tile-ico ico-fuel"></span><span class="lab">Tanken</span></button></div>
+                    <div class="tile-cell"><button class="tile" id="btnLoadEfb" data-key="3" type="button"><b class="n">3</b><span class="tile-ico ico-efb"></span><span class="lab">Ins EFB laden</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="board" data-key="4" type="button"><b class="n">4</b><span class="tile-ico ico-board"></span><span class="lab">Boarding</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="pushback" data-key="5" type="button"><b class="n">5</b><span class="tile-ico ico-pushback"></span><span class="lab">Pushback</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="jetway" data-key="6" type="button"><b class="n">6</b><span class="tile-ico ico-jetway"></span><span class="lab">Jetway</span></button></div>
+                    <div class="tile-cell"><button class="tile" data-go="ramp" data-key="7" type="button"><b class="n">7</b><span class="tile-ico ico-ramp"></span><span class="lab">Vorfeld</span></button></div>
+                    <div class="tile-cell"><button class="tile" data-go="more" data-key="8" type="button"><b class="n">8</b><span class="tile-ico ico-more"></span><span class="lab">Mehr</span></button></div>
+                    <div class="tile-cell"><button class="tile" id="btnWebLogin" data-key="9" type="button"><b class="n">9</b><span class="tile-ico ico-login"></span><span class="lab">Website Login</span></button></div>
+                  </div>
+                </section>
+
+                <section id="viewGsx" class="view hidden">
+                  <div class="tile-grid">
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="deboard" data-key="1" type="button"><b class="n">1</b><span class="tile-ico ico-deboard"></span><span class="lab">Deboarding</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="catering" data-key="2" type="button"><b class="n">2</b><span class="tile-ico ico-catering"></span><span class="lab">Catering</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="call_truck" data-key="3" type="button"><b class="n">3</b><span class="tile-ico ico-fuel"></span><span class="lab">Tankwagen</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="board" data-key="4" type="button"><b class="n">4</b><span class="tile-ico ico-board"></span><span class="lab">Boarding</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="pushback" data-key="5" type="button"><b class="n">5</b><span class="tile-ico ico-pushback"></span><span class="lab">Pushback</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="jetway" data-key="6" type="button"><b class="n">6</b><span class="tile-ico ico-jetway"></span><span class="lab">Jetway</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="stairs" data-key="7" type="button"><b class="n">7</b><span class="tile-ico ico-stairs"></span><span class="lab">Stairs</span></button></div>
+                    <div class="tile-cell"><button class="tile" data-fuel-sim="gsx" data-key="8" type="button"><b class="n">8</b><span class="tile-ico ico-fuel-direct"></span><span class="lab">GSX tanken</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="reposition" data-key="9" type="button"><b class="n">9</b><span class="tile-ico ico-reposition"></span><span class="lab">Reposition</span></button></div>
+                  </div>
+                </section>
+
+                <section id="viewFuel" class="view hidden">
+                  <div class="fuel-app">
+                    <div class="fuel-row">
+                      <span id="fuelIcao">-</span>
+                      <span id="fuelType">JET A</span>
+                    </div>
+                    <div class="fuel-price-card">
+                      <em>Preis</em>
+                      <strong id="fuelPrice">-</strong>
+                      <small id="fuelEst">-</small>
+                    </div>
+                    <div class="fuel-big" id="fuelRead">-</div>
+                    <div class="fuel-bar"><span id="fuelBar"></span></div>
+                    <div class="fuel-edit">
+                      <input id="fuelAmount" type="text" />
+                      <span id="fuelUnitLbl">gal</span>
+                    </div>
+                    <input id="fuelRange" type="range" min="0" max="100" step="0.1" value="0" />
+                    <label class="fuel-lab" id="fuelSellerLab">Anbieter</label>
+                    <select id="fuelSeller"></select>
+                    <small id="fuelStock">-</small>
+                  </div>
+                  <div class="tile-grid tile-grid-fuel">
+                    <div class="tile-cell"><button class="tile fuel-pct" data-pct="0" data-key="1" type="button"><b class="n">1</b><span class="lab">Leer</span></button></div>
+                    <div class="tile-cell"><button class="tile fuel-pct" data-pct="25" data-key="2" type="button"><b class="n">2</b><span class="lab">25%</span></button></div>
+                    <div class="tile-cell"><button class="tile fuel-pct" data-pct="50" data-key="3" type="button"><b class="n">3</b><span class="lab">50%</span></button></div>
+                    <div class="tile-cell"><button class="tile fuel-pct" data-pct="75" data-key="4" type="button"><b class="n">4</b><span class="lab">75%</span></button></div>
+                    <div class="tile-cell"><button class="tile fuel-pct" data-pct="100" data-key="5" type="button"><b class="n">5</b><span class="lab">Voll</span></button></div>
+                    <div class="tile-cell"><button class="tile" id="btnFuelUnit" data-key="6" type="button"><b class="n">6</b><span class="lab">gal</span></button></div>
+                    <div class="tile-cell"><button class="tile mode on" data-mode="auto" data-key="7" type="button"><b class="n">7</b><span class="lab">Auto</span></button></div>
+                    <div class="tile-cell"><button class="tile mode" data-mode="gsx" data-key="8" type="button"><b class="n">8</b><span class="lab">GSX</span></button></div>
+                    <div class="tile-cell"><button class="tile mode" data-mode="direct" data-key="9" type="button"><b class="n">9</b><span class="lab">Direkt</span></button></div>
+                  </div>
+                  <div id="fuelPace" class="fuel-pace hidden">
+                    <button id="btnPaceSlow" class="on" type="button">Langsam</button>
+                    <button id="btnPaceFast" type="button">Schnell</button>
+                  </div>
+                </section>
+
+                <section id="viewMore" class="view hidden">
+                  <div class="tile-grid">
+                    <div class="tile-cell"><button class="tile" id="btnLivery" data-key="1" type="button"><b class="n">1</b><span class="tile-ico ico-more"></span><span class="lab">Livery anfragen</span></button></div>
+                    <div class="tile-cell"><button class="tile" id="btnWebLoginAlt" data-key="2" type="button"><b class="n">2</b><span class="tile-ico ico-login"></span><span class="lab">Website Login</span></button></div>
+                    <div class="tile-cell"><button class="tile" id="btnCancel" data-key="3" type="button"><b class="n">3</b><span class="tile-ico ico-reset"></span><span class="lab">Flug abbrechen</span></button></div>
+                    <div class="tile-cell"><button class="tile" id="btnLog2" data-key="4" type="button"><b class="n">4</b><span class="tile-ico ico-efb"></span><span class="lab">Protokoll</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="reset" data-key="5" type="button"><b class="n">5</b><span class="tile-ico ico-reset"></span><span class="lab">Reset Pos.</span></button></div>
+                    <div class="tile-cell"><button class="tile gsx-act" data-gsx="reposition" data-key="6" type="button"><b class="n">6</b><span class="tile-ico ico-reposition"></span><span class="lab">Reposition</span></button></div>
+                    <div class="tile-cell"><button class="tile" data-go="keys" data-key="7" type="button"><b class="n">7</b><span class="tile-ico ico-keys"></span><span class="lab">Tasten</span></button></div>
+                    <div class="tile-cell"><button class="tile" id="btnReport" data-key="8" type="button"><b class="n">8</b><span class="tile-ico ico-more"></span><span class="lab">Problem melden</span></button></div>
+                    <div class="tile-cell"><button class="tile" type="button" disabled><span class="lab"></span></button></div>
+                  </div>
+                  <p class="fine" id="statusLine">Client starten.</p>
+                </section>
+
+                <section id="viewRamp" class="view hidden">
+                  <div class="tile-grid">
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="marshaller" data-key="1" type="button"><b class="n">1</b><span class="tile-ico ico-board"></span><span class="lab">Einwinker</span></button></div>
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="tarmac" data-key="2" type="button"><b class="n">2</b><span class="tile-ico ico-deboard"></span><span class="lab">Personal</span></button></div>
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="fuel" data-key="3" type="button"><b class="n">3</b><span class="tile-ico ico-fuel"></span><span class="lab">Tankwagen</span></button></div>
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="baggage" data-key="4" type="button"><b class="n">4</b><span class="tile-ico ico-board"></span><span class="lab">Gepaeck</span></button></div>
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="loader" data-key="5" type="button"><b class="n">5</b><span class="tile-ico ico-pushback"></span><span class="lab">Loader</span></button></div>
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="stairs" data-key="6" type="button"><b class="n">6</b><span class="tile-ico ico-stairs"></span><span class="lab">Treppe</span></button></div>
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="catering" data-key="7" type="button"><b class="n">7</b><span class="tile-ico ico-catering"></span><span class="lab">Catering</span></button></div>
+                    <div class="tile-cell"><button class="tile" data-go="ramp2" data-key="8" type="button"><b class="n">8</b><span class="tile-ico ico-more"></span><span class="lab">Fahrzeuge</span></button></div>
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="clear" data-key="9" type="button"><b class="n">9</b><span class="tile-ico ico-reset"></span><span class="lab">Alles weg</span></button></div>
+                  </div>
+                </section>
+
+                <section id="viewRamp2" class="view hidden">
+                  <div class="tile-grid">
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="gpu" data-key="1" type="button"><b class="n">1</b><span class="tile-ico ico-fuel-direct"></span><span class="lab">GPU</span></button></div>
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="pushback" data-key="2" type="button"><b class="n">2</b><span class="tile-ico ico-pushback"></span><span class="lab">Pushback</span></button></div>
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="fire" data-key="3" type="button"><b class="n">3</b><span class="tile-ico ico-reposition"></span><span class="lab">Feuerwehr</span></button></div>
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="shuttle" data-key="4" type="button"><b class="n">4</b><span class="tile-ico ico-jetway"></span><span class="lab">Shuttle</span></button></div>
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="tug" data-key="5" type="button"><b class="n">5</b><span class="tile-ico ico-pushback"></span><span class="lab">Tug</span></button></div>
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="caddy" data-key="6" type="button"><b class="n">6</b><span class="tile-ico ico-gsx"></span><span class="lab">Caddy</span></button></div>
+                    <div class="tile-cell"><button class="tile" type="button" disabled><span class="lab"></span></button></div>
+                    <div class="tile-cell"><button class="tile" type="button" disabled><span class="lab"></span></button></div>
+                    <div class="tile-cell"><button class="tile spawn-act" data-spawn="clear" data-key="9" type="button"><b class="n">9</b><span class="tile-ico ico-reset"></span><span class="lab">Alles weg</span></button></div>
+                  </div>
+                </section>
+
+                <section id="viewKeys" class="view hidden">
+                  <div class="keys-app">
+                    <p class="keys-hint" id="keysHint">Eine Taste fuer Start und Loggen – Tastatur, Yoke oder Honeycomb-Throttle. Wirkt bei geschlossenem Panel.</p>
+                    <label class="keys-lab">Flug starten / loggen</label>
+                    <button id="btnBindStart" class="keys-bind" type="button">Beliebige Taste druecken</button>
+                    <label class="keys-lab">Ton <span id="keysVolLbl">35%</span></label>
+                    <input id="keysVol" type="range" min="0" max="100" value="35" />
+                  </div>
+                  <div class="tile-grid">
+                    <div class="tile-cell"><button class="tile" id="btnClearStart" data-key="1" type="button"><b class="n">1</b><span class="lab">Taste loeschen</span></button></div>
+                    <div class="tile-cell"><button class="tile" id="btnKeysTest" data-key="2" type="button"><b class="n">2</b><span class="lab">Ton testen</span></button></div>
+                    <div class="tile-cell"><button class="tile" type="button" disabled><span class="lab"></span></button></div>
+                    <div class="tile-cell"><button class="tile" type="button" disabled><span class="lab"></span></button></div>
+                    <div class="tile-cell"><button class="tile" type="button" disabled><span class="lab"></span></button></div>
+                    <div class="tile-cell"><button class="tile" type="button" disabled><span class="lab"></span></button></div>
+                    <div class="tile-cell"><button class="tile" type="button" disabled><span class="lab"></span></button></div>
+                    <div class="tile-cell"><button class="tile" type="button" disabled><span class="lab"></span></button></div>
+                    <div class="tile-cell"><button class="tile" type="button" disabled><span class="lab"></span></button></div>
+                  </div>
+                </section>
+              </div>
+
+              <button id="btnFlight" class="cta red" type="button" disabled>Flug starten</button>
+              <button id="btnFuelHold" class="hold hidden" type="button" disabled>
+                <span id="holdFill" class="hold-fill"></span>
+                <span id="holdLbl">Tanken</span>
+              </button>
+
+              <nav class="dock">
+                <button id="btnBack" class="dock-back is-off" data-go="home" type="button">Zurueck</button>
+                <div class="home-pill"></div>
+                <span class="dock-spacer"></span>
+              </nav>
+
+              <div id="logModal" class="modal hidden">
+                <div class="modal-card">
+                  <div class="modal-head">
+                    <strong>Protokoll</strong>
+                    <button id="btnLogClose" type="button">X</button>
+                  </div>
+                  <pre id="log">Noch keine Eintraege.</pre>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </div>
+      </div>
+        <button id="btnResize" class="chrome-grip" type="button" title="Größe ziehen" aria-label="Größe ziehen">
+          <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+            <path fill="currentColor" d="M4 20h4v-2H6v-2H4v4zm0-6h2V8H4v6zm14-10v2h2v2h2V4h-4zM4 6h6V4H4v2zm10 14h6v-2h-6v2z"/>
+          </svg>
+        </button>
+      </div>
+    
+</body>
+</html>

@@ -1,0 +1,55 @@
+# Paketversionen der Build-Umgebung, mit der die ausgelieferten Programme
+# (MiniClient 2.11.12 und 2.11.12.1, Updater 1.0.5, Browser inApp 1.0.1) gebaut wurden.
+# Package versions of the build environment used for the distributed programs.
+# Python: CPython 3.14.0 (64 bit), Windows. Installer: Inno Setup 6.7.0 (2.11.12),
+# 6.7.3 (Setups MiniClient 2.11.12.1 und neu verpacktes Updater-Setup 1.0.5).
+#
+#   python -m pip install -r requirements.txt pyinstaller -c build-constraints.txt
+#
+# Die build_*.bat rufen pip ohne "-c build-constraints.txt" auf; vorher wie oben
+# installieren, dann ändert ihr pip-Aufruf nichts mehr.
+# The build_*.bat scripts call pip without "-c build-constraints.txt"; install as
+# above first, then their pip call changes nothing.
+
+# Laufzeit-Pakete / runtime packages
+SimConnect==0.4.26
+requests==2.32.5
+urllib3==2.6.2
+idna==3.11
+charset-normalizer==3.4.4
+certifi==2025.11.12
+pywebview==6.2.1
+bottle==0.13.4
+proxy_tools==0.1.0
+pythonnet==3.1.0
+clr_loader==0.3.1
+cffi==2.0.0
+pycparser==3.0
+pystray==0.19.5
+six==1.17.0
+Pillow==12.3.0
+pypresence==4.6.2
+typing_extensions==4.15.0
+
+# Build-Werkzeuge und ihre Abhängigkeiten / build tools and their dependencies
+pyinstaller==6.17.0
+pyinstaller-hooks-contrib==2025.10
+setuptools==80.9.0
+packaging==25.0
+altgraph==0.17.5
+pefile==2024.8.26
+pywin32-ctypes==0.2.3
+
+# Nur für eine genaue Nachbildung der ausgelieferten EXE-Dateien: diese Pakete
+# lagen in der Build-Umgebung, und PyInstaller hat sie mit eingepackt
+# (siehe THIRD-PARTY-NOTICES.md, (*)). Nur wirksam, wenn man sie installiert:
+# Only for an exact rebuild of the distributed executables: these packages were
+# installed in the build environment and PyInstaller bundled them (see
+# THIRD-PARTY-NOTICES.md, (*)). Only effective if you install them:
+#
+#   python -m pip install numpy cryptography bcrypt psutil -c build-constraints.txt
+#
+numpy==2.4.6
+cryptography==46.0.3
+bcrypt==5.0.0
+psutil==7.2.1

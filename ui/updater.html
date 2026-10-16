@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FlyConomy Updater</title>
+  <style>
+    :root {
+      --ink: #14181f;
+      --muted: #5f6b7a;
+      --blue: #1a73e8;
+      --blue-soft: #e8f0fe;
+      --green: #1e8e3e;
+      --warn: #b45309;
+      --danger: #c5221f;
+      --line: #e3e8ef;
+      --card: #fff;
+      --bg: linear-gradient(165deg, #f3f6fb 0%, #e8f0fe 46%, #f8fafc 100%);
+    }
+    * { box-sizing: border-box; }
+    html, body { height: 100%; margin: 0; }
+    body {
+      font-family: "Segoe UI", system-ui, sans-serif;
+      color: var(--ink);
+      background: var(--bg);
+    }
+    .wrap {
+      height: 100%;
+      display: grid;
+      grid-template-rows: auto auto 1fr auto;
+      gap: 12px;
+      padding: 16px 18px 14px;
+    }
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .brand { display: flex; align-items: center; gap: 10px; }
+    .mark {
+      width: 36px; height: 36px; border-radius: 11px;
+      display: grid; place-items: center; color: #fff; font-weight: 800;
+      background: linear-gradient(135deg, #1a73e8, #0b57d0);
+    }
+    h1 { margin: 0; font-size: 1.18rem; letter-spacing: -0.03em; }
+    .sub { margin: 2px 0 0; color: var(--muted); font-size: 0.82rem; }
+    .path {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      padding: 10px 12px; border-radius: 14px; background: var(--card);
+      border: 1px solid var(--line);
+    }
+    .path b { font-size: 0.78rem; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .path code { flex: 1; min-width: 180px; font-size: 0.8rem; color: #0b57d0; word-break: break-all; }
+    .cards { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; min-height: 0; }
+    .card {
+      background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+      padding: 14px; display: grid; gap: 8px; align-content: start;
+    }
+    .card h2 { margin: 0; font-size: 0.98rem; }
+    .meta { color: var(--muted); font-size: 0.8rem; line-height: 1.4; }
+    .pill {
+      display: inline-flex; align-items: center; height: 22px; padding: 0 8px;
+      border-radius: 999px; font-size: 0.72rem; font-weight: 800;
+      background: #eef2f6; color: var(--muted);
+    }
+    .pill.ok { background: #e6f4ea; color: var(--green); }
+    .pill.warn { background: #fff3e0; color: var(--warn); }
+    .pill.off { background: #fdecea; color: var(--danger); }
+    .actions { display: flex; flex-wrap: wrap; gap: 6px; }
+    button {
+      border: 0; border-radius: 10px; padding: 8px 10px; cursor: pointer;
+      font-weight: 700; font-size: 0.8rem;
+    }
+    button:disabled { opacity: .55; cursor: default; }
+    .primary { background: var(--blue); color: #fff; }
+    .ghost { background: #f3f6fb; color: var(--ink); }
+    .danger { background: #fdecea; color: var(--danger); }
+    .foot {
+      display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+    }
+    .log {
+      height: 120px; overflow: auto; padding: 10px 12px; border-radius: 14px;
+      background: #0f1b2d; color: #d7e3f4; font: 12px/1.45 Consolas, monospace;
+    }
+    .busy { color: var(--blue); font-weight: 700; font-size: 0.84rem; }
+    label.check { display: flex; align-items: center; gap: 8px; font-size: 0.84rem; color: var(--muted); }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <header>
+      <div class="brand">
+        <div class="mark">FC</div>
+        <div>
+          <h1>FlyConomy Updater</h1>
+          <p class="sub" id="verLine">v1.0.2 · hält sich selbst aktuell</p>
+        </div>
+      </div>
+      <div class="actions">
+        <button class="primary" id="btnCheck">Nach Updates suchen</button>
+        <button class="ghost" id="btnHide">In den Hintergrund</button>
+      </div>
+    </header>
+
+    <div class="path">
+      <b>Community</b>
+      <code id="community">–</code>
+      <button class="ghost" id="btnFolder">Ordner wählen</button>
+    </div>
+
+    <section class="cards">
+      <article class="card">
+        <h2>MiniClient <span class="pill" id="miniPill">–</span></h2>
+        <div class="meta" id="miniMeta">Noch nicht geprüft.</div>
+        <div class="actions">
+          <button class="ghost" id="btnMiniStart">Starten</button>
+          <button class="danger" id="btnMiniUn">Deinstallieren</button>
+        </div>
+      </article>
+      <article class="card">
+        <h2>MSFS Panel <span class="pill" id="panelPill">–</span></h2>
+        <div class="meta" id="panelMeta">Noch nicht geprüft.</div>
+        <div class="actions">
+          <button class="danger" id="btnPanelUn">Deinstallieren</button>
+        </div>
+      </article>
+      <article class="card">
+        <h2>Voller Client <span class="pill" id="fullPill">–</span></h2>
+        <div class="meta" id="fullMeta">Nur manuell installieren.</div>
+        <div class="actions">
+          <button class="primary" id="btnFullIn">Installieren</button>
+          <button class="danger" id="btnFullUn">Deinstallieren</button>
+        </div>
+      </article>
+      <article class="card">
+        <h2>Updater <span class="pill" id="selfPill">–</span></h2>
+        <div class="meta" id="selfMeta">Aktualisiert sich selbst, sobald eine neue Version online ist.</div>
+      </article>
+    </section>
+
+    <div>
+      <div class="foot">
+        <label class="check"><input type="checkbox" id="autostart" /> Mit Windows starten</label>
+        <span class="busy" id="busy"></span>
+      </div>
+      <div class="log" id="log"></div>
+    </div>
+  </div>
+  <script>
+    const api = () => window.pywebview.api
+    let busy = false
+
+    function pill(el, text, kind) {
+      el.textContent = text
+      el.className = 'pill ' + (kind || '')
+    }
+    function setBusy(on, label) {
+      busy = on
+      document.getElementById('busy').textContent = on ? (label || 'Arbeitet…') : ''
+      document.querySelectorAll('button').forEach((b) => {
+        if (b.id === 'btnHide') return
+        b.disabled = on
+      })
+    }
+    function render(s) {
+      if (!s) return
+      document.getElementById('community').textContent = s.community || 'nicht gefunden'
+      document.getElementById('autostart').checked = !!s.autostart
+      const mini = s.mini || {}
+      const panel = s.panel || {}
+      const full = s.full || {}
+      const self = s.self || {}
+      document.getElementById('verLine').textContent = self.outdated
+        ? `v${s.updater} · Update ${self.latest} wird automatisch installiert`
+        : `v${s.updater} · hält sich selbst aktuell`
+      document.getElementById('selfMeta').textContent = self.outdated
+        ? `Installiert ${self.version || s.updater} · neu ${self.latest} – Selbstupdate läuft`
+        : `Installiert ${self.version || s.updater} · aktuell. Neue Versionen kommen automatisch.`
+      document.getElementById('miniMeta').textContent = mini.installed
+        ? `Installiert ${mini.version || '–'} · aktuell ${mini.latest || '–'}${mini.running ? ' · läuft' : ''}${s.waitFlight ? ' · Update wartet auf Flugende' : ''}`
+        : `Nicht installiert · aktuell ${mini.latest || '–'} (wird automatisch eingerichtet)`
+      document.getElementById('panelMeta').textContent = panel.installed
+        ? `Installiert ${panel.version || '–'} · aktuell ${panel.latest || '–'}`
+        : `Nicht installiert · aktuell ${panel.latest || '–'} (wird automatisch eingerichtet)`
+      document.getElementById('fullMeta').textContent = full.installed
+        ? `Installiert ${full.version || '–'} · aktuell ${full.latest || '–'}`
+        : `Nicht installiert · aktuell ${full.latest || '–'} · nur per Button`
+      pill(document.getElementById('miniPill'), mini.installed ? (s.waitFlight && mini.outdated ? 'Wartet' : (mini.outdated ? 'Update' : 'OK')) : 'Auto', mini.installed ? (s.waitFlight && mini.outdated ? 'warn' : (mini.outdated ? 'warn' : 'ok')) : 'warn')
+      pill(document.getElementById('panelPill'), panel.installed ? (panel.outdated ? 'Update' : 'OK') : 'Auto', panel.installed ? (panel.outdated ? 'warn' : 'ok') : 'warn')
+      pill(document.getElementById('fullPill'), full.installed ? (full.outdated ? 'Update' : 'OK') : 'Manuell', full.installed ? (full.outdated ? 'warn' : 'ok') : 'off')
+      pill(document.getElementById('selfPill'), self.outdated ? 'Update' : 'Auto', self.outdated ? 'warn' : 'ok')
+      document.getElementById('log').textContent = (s.logs || []).join('\n')
+      document.getElementById('log').scrollTop = 9999
+      setBusy(!!s.busy, s.busyLabel)
+      if (s.waitFlight && !s.busy) {
+        document.getElementById('busy').textContent = s.waitFlightMsg || 'Update wartet auf Flugende'
+      }
+    }
+    async function call(name, arg) {
+      try {
+        setBusy(true)
+        const r = arg === undefined ? await api()[name]() : await api()[name](arg)
+        render(r.state || (await api().get_state()))
+        if (r && r.ok === false && r.error) alert(r.error)
+      } catch (e) {
+        alert(String(e))
+      }
+    }
+    async function refresh() {
+      try { render(await api().get_state()) } catch (e) {}
+    }
+    window.addEventListener('pywebviewready', () => {
+      refresh()
+      setInterval(refresh, 1200)
+    })
+    document.getElementById('btnCheck').onclick = () => call('check_now')
+    document.getElementById('btnHide').onclick = () => api().hide()
+    document.getElementById('btnFolder').onclick = () => call('pick_community')
+    document.getElementById('btnMiniStart').onclick = () => call('start_mini')
+    document.getElementById('btnMiniUn').onclick = () => { if (confirm('MiniClient deinstallieren?')) call('uninstall', 'mini') }
+    document.getElementById('btnPanelUn').onclick = () => { if (confirm('Panel aus dem Community-Ordner entfernen?')) call('uninstall', 'panel') }
+    document.getElementById('btnFullIn').onclick = () => call('install_full')
+    document.getElementById('btnFullUn').onclick = () => { if (confirm('Vollen Client deinstallieren?')) call('uninstall', 'full') }
+    document.getElementById('autostart').onchange = (e) => call('set_autostart', e.target.checked)
+  </script>
+</body>
+</html>

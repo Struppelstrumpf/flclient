@@ -1,0 +1,29 @@
+# UTF-8
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=(2, 11, 4, 0),
+    prodvers=(2, 11, 4, 0),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+    ),
+  kids=[
+    StringFileInfo(
+      [
+      StringTable(
+        '040904B0',
+        [StringStruct('CompanyName', 'FlyConomy'),
+        StringStruct('FileDescription', 'FlyConomy Desktop Client'),
+        StringStruct('FileVersion', '2.11.4'),
+        StringStruct('InternalName', 'FlyConomyClient'),
+        StringStruct('LegalCopyright', 'FlyConomy'),
+        StringStruct('OriginalFilename', 'FlyConomyClient.exe'),
+        StringStruct('ProductName', 'FlyConomy'),
+        StringStruct('ProductVersion', '2.11.4')])
+      ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)

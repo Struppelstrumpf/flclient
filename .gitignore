@@ -1,0 +1,38 @@
+# Build-Ausgaben / build outputs (PyInstaller, Inno Setup)
+build/
+dist/
+installer/
+*.exe
+*.msi
+*.zip
+*.pkg
+*.pyz
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Lokale Konfiguration, Logs, Schlüssel / local config, logs, keys
+*.ini
+*.log
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+*.p12
+*.crt
+*.cer
+
+# Editor / OS
+.idea/
+.vscode/
+*.swp
+Thumbs.db
+Desktop.ini
+
+# Hinweis: *.spec NICHT ignorieren – die PyInstaller-Specs gehören zum Quellcode.
+# Note: do NOT ignore *.spec – the PyInstaller specs are part of the source.

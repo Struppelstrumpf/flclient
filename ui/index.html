@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>FlyConomy</title>
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+  <link rel="stylesheet" href="app.css" />
+</head>
+<body>
+  <div class="app locked" id="appShell">
+    <aside class="rail">
+      <button type="button" class="brand" id="btnWebsite" title="FlyConomy Website">
+        <span class="brand-mark" aria-hidden="true"><i class="fas fa-globe"></i></span>
+      </button>
+      <nav id="mainNav">
+        <button type="button" class="nav-btn" data-route="dashboard" title="Home">
+          <i class="fas fa-home ico" aria-hidden="true"></i><span>Home</span>
+        </button>
+        <button type="button" class="nav-btn active" data-route="myflight" title="Mein Flug">
+          <i class="fas fa-plane ico" aria-hidden="true"></i><span>Flug</span>
+        </button>
+        <button type="button" class="nav-btn" data-route="groupflights" title="Gruppenflüge">
+          <i class="fas fa-people-group ico" aria-hidden="true"></i><span>Gruppe</span>
+        </button>
+        <button type="button" class="nav-btn" data-route="map" title="Planner">
+          <i class="fas fa-map ico" aria-hidden="true"></i><span>Map</span>
+        </button>
+        <button type="button" class="nav-btn" data-route="aircraft" title="Flotte">
+          <i class="fas fa-jet-fighter ico" aria-hidden="true"></i><span>Flotte</span>
+        </button>
+        <button type="button" class="nav-btn" data-route="airport" title="Airports">
+          <i class="fas fa-plane-departure ico" aria-hidden="true"></i><span>Airports</span>
+        </button>
+        <button type="button" class="nav-btn" data-route="hotels" title="Hotels">
+          <i class="fas fa-hotel ico" aria-hidden="true"></i><span>Hotels</span>
+        </button>
+        <button type="button" class="nav-btn" data-route="fbos" title="FBOs">
+          <i class="fas fa-building ico" aria-hidden="true"></i><span>FBOs</span>
+        </button>
+        <button type="button" class="nav-btn" data-route="goods" title="Güter">
+          <i class="fas fa-boxes-stacked ico" aria-hidden="true"></i><span>Güter</span>
+        </button>
+        <button type="button" class="nav-btn" data-route="banksummary" title="Bank">
+          <i class="fas fa-landmark ico" aria-hidden="true"></i><span>Bank</span>
+        </button>
+        <button type="button" class="nav-btn" data-route="log" title="Log">
+          <i class="fas fa-book ico" aria-hidden="true"></i><span>Log</span>
+        </button>
+        <button type="button" class="nav-btn" data-route="airline" title="Airlines">
+          <i class="fas fa-users ico" aria-hidden="true"></i><span>Airline</span>
+        </button>
+        <button type="button" class="nav-btn" data-route="forum" title="Forum">
+          <i class="fas fa-comments ico" aria-hidden="true"></i><span>Forum</span>
+        </button>
+        <button type="button" class="nav-btn" data-route="downloads" title="Downloads">
+          <i class="fas fa-download ico" aria-hidden="true"></i><span>Down</span>
+        </button>
+      </nav>
+      <div class="rail-foot">
+        <button type="button" class="nav-btn" id="btnAccount" title="Konto">
+          <i class="fas fa-user ico" aria-hidden="true"></i><span id="railUser">Konto</span>
+        </button>
+      </div>
+    </aside>
+
+    <main class="main">
+      <!-- My Flight only: same top status bar as other pages, then SimConnect controls -->
+      <div id="appTopbar" class="app-topbar hidden">
+        <div class="app-topbar-inner">
+          <div class="top-left">
+            <strong id="topName">—</strong>
+            <span id="statFlight" class="fc-pill">Kein Flug</span>
+            <span id="statAircraft" class="flight-ac hidden"></span>
+          </div>
+          <div class="top-right">
+            <span>Cash <b id="topCash">$0</b></span>
+            <span>Bank <b id="topBank">$0</b></span>
+          </div>
+        </div>
+      </div>
+
+      <div id="myflightOps" class="myflight-ops hidden">
+        <div class="ops-row">
+          <span id="chipSim" class="fc-pill sim-off">MSFS getrennt</span>
+          <p class="ops-hint" id="flightHint">Zuerst MSFS starten, dann verbinden.</p>
+          <button type="button" id="btnCancel" class="btn ghost sm" disabled>Abbrechen</button>
+          <button type="button" id="btnToggleLog" class="btn ghost sm">Log</button>
+        </div>
+        <div id="alertBox" class="alert-banner hidden" role="alert"></div>
+        <div class="sim-id" id="simIdCard">
+          <div>
+            <span>Sim-Modell</span>
+            <strong id="simTitle">—</strong>
+          </div>
+          <div>
+            <span>Standort</span>
+            <strong id="simIcao">—</strong>
+          </div>
+          <button type="button" id="btnLivery" class="btn ghost sm">Livery anfragen</button>
+        </div>
+        <div class="flight-deck">
+          <button type="button" id="btnConnect" class="deck-btn connect">
+            <span class="deck-kicker">Sim</span>
+            <strong>MSFS verbinden</strong>
+          </button>
+          <button type="button" id="btnStart" class="deck-btn start" disabled>
+            <span class="deck-kicker">Start</span>
+            <strong>Flug starten</strong>
+          </button>
+        </div>
+        <pre id="logBox" class="log collapsed"></pre>
+      </div>
+
+      <section id="view-site" class="view active site-view">
+        <iframe id="siteFrame" class="site-frame" title="FlyConomy" src="about:blank"></iframe>
+      </section>
+
+      <section id="view-account" class="view">
+        <header class="page-head">
+          <div>
+            <h1>Konto</h1>
+            <p>Discord-Login speichern / abmelden. Sprache: Zahnrad auf den Website-Seiten.</p>
+          </div>
+        </header>
+        <div class="panel account-card">
+          <div class="account-hero">
+            <div class="avatar" id="avatar">FC</div>
+            <div>
+              <h2 id="accountName">—</h2>
+              <p id="accountSub">Angemeldet</p>
+            </div>
+          </div>
+          <div class="account-actions">
+            <button type="button" id="btnOpenSettingsHint" class="btn ghost">Zu Mein Flug</button>
+            <button type="button" id="btnLogout" class="btn ghost">Abmelden</button>
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <div id="loginGate" class="login-gate">
+    <div class="login-card">
+      <div class="brand-mark lg">FC</div>
+      <h1>FlyConomy</h1>
+      <p class="login-ver" id="loginVer">Client</p>
+      <p>Melde dich mit Discord an, um die App zu nutzen. Ohne Login gibt es keinen Zugang – auch keinen Gastmodus.</p>
+      <button type="button" id="btnGateLogin" class="btn primary">Mit Discord anmelden</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
